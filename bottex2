@@ -1,0 +1,454 @@
+//+------------------------------------------------------------------+
+//| SmartGrid.mq5                                                    |
+//| Lenh A: DCA cung xu huong (ban tu vao A1, EA DCA theo)           |
+//| Lenh B: Hedge nguoc chieu khi gia vuot 50 pip tu A1              |
+//+------------------------------------------------------------------+
+#property copyright "SmartGrid"
+#property version   "1.00"
+
+#include <Trade/Trade.mqh>
+
+//--- Input groups
+input group "=== LENH A (TREND) ==="
+input int    MagicA1           = 100001;  // Magic number lenh A-1 (ban tu set khi vao tay)
+input int    MagicA_DCA        = 100002;  // Magic number lenh A DCA (EA tu mo)
+input double LotA              = 0.01;    // Lot lenh A DCA
+input double MaxLossA_Pct      = 40.0;   // Dung DCA A khi lo qua X% tai khoan
+input double TakeProfitA_Pct   = 2.0;    // Chot loi moi lenh A khi dat X% tai khoan
+input int    DCA_A_Distance    = 7;       // Khoang cach DCA lenh A (pip)
+input int    Max_A_Levels      = 20;      // So lenh A DCA toi da
+
+input group "=== LENH B (HEDGE) ==="
+input int    MagicB            = 200001;  // Magic number lenh B
+input double LotB              = 0.01;    // Lot moi lenh B (deu nhau)
+input double MaxLossB_Pct      = 30.0;   // Tong lo lenh B toi da X% tai khoan
+input double TakeProfitB_Pct   = 1.5;    // Chot loi moi lenh B khi dat X% tai khoan
+input int    B_TriggerPips     = 50;      // Kich hoat lenh B khi gia nguoc X pip tu A1
+input int    B_NumLevels       = 12;      // So lenh B rai (10-15)
+input int    B_SpreadPips      = 50;      // Tong bien lenh B (pip) rai deu
+
+input group "=== SYSTEM ==="
+input int    DeviationPoints   = 30;
+
+//--- Pip point multiplier
+int    g_pip_points = 10;
+CTrade trade;
+
+//--- Trang thai lenh A
+double g_A1_open_price   = 0;     // Gia mo lenh A1
+int    g_A1_direction    = 0;     // 1=BUY, -1=SELL
+bool   g_A1_detected     = false; // Da phat hien A1 chua
+double g_A_avg_price     = 0;     // Gia trung binh lenh A
+int    g_A_dca_levels    = 0;     // So lenh A DCA hien tai
+
+//--- Trang thai lenh B
+bool   g_B_triggered     = false; // Da kich hoat lenh B chua
+int    g_B_levels_opened = 0;     // So lenh B da mo
+
+//--- Muc DCA lenh A
+struct GridLevel
+{
+   double price;
+   double lot;
+   bool   opened;
+};
+GridLevel g_A_grid[];
+GridLevel g_B_grid[];
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   g_pip_points = (digits == 2 || digits == 4) ? 10 : 100;
+
+   ArrayResize(g_A_grid, Max_A_Levels);
+   ArrayResize(g_B_grid, B_NumLevels);
+
+   trade.SetDeviationInPoints(DeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   Print("SmartGrid: khoi dong. Magic A1=", MagicA1, " Magic A_DCA=", MagicA_DCA, " Magic B=", MagicB);
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason) {}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   DetectA1();
+   if(!g_A1_detected) return;
+
+   ManageLenhA();
+   CheckTriggerLenhB();
+   if(g_B_triggered) ManageLenhB();
+   CheckBalanceHedge();
+}
+
+//+------------------------------------------------------------------+
+// Phat hien lenh A1 do ban tu vao tay
+//+------------------------------------------------------------------+
+void DetectA1()
+{
+   if(g_A1_detected) return;
+
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicA1) continue;
+
+      g_A1_open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      g_A1_direction  = (PositionGetInteger(POSITION_TYPE) == POSITION_TYPE_BUY) ? 1 : -1;
+      g_A1_detected   = true;
+
+      Print("SmartGrid: phat hien lenh A1 ", (g_A1_direction == 1 ? "BUY" : "SELL"),
+            " @ ", g_A1_open_price);
+
+      BuildA_DCAGrid();
+      return;
+   }
+}
+
+//+------------------------------------------------------------------+
+// Xay dung luoi DCA cho lenh A
+//+------------------------------------------------------------------+
+void BuildA_DCAGrid()
+{
+   double pip = _Point * g_pip_points;
+   for(int i = 0; i < Max_A_Levels; i++)
+   {
+      if(g_A1_direction == 1) // BUY: DCA xuong
+         g_A_grid[i].price = g_A1_open_price - ((i + 1) * DCA_A_Distance * pip);
+      else // SELL: DCA len
+         g_A_grid[i].price = g_A1_open_price + ((i + 1) * DCA_A_Distance * pip);
+
+      g_A_grid[i].lot    = NormalizeLot(LotA);
+      g_A_grid[i].opened = false;
+   }
+   Print("SmartGrid: da xay dung luoi DCA lenh A - ", Max_A_Levels, " muc.");
+}
+
+//+------------------------------------------------------------------+
+// Quan ly lenh A: DCA them + chot loi tung lenh
+//+------------------------------------------------------------------+
+void ManageLenhA()
+{
+   double balance   = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity    = AccountInfoDouble(ACCOUNT_EQUITY);
+   double total_pnl = GetTotalPNL(MagicA1) + GetTotalPNL(MagicA_DCA);
+   double loss_pct  = (total_pnl < 0) ? (MathAbs(total_pnl) / balance * 100.0) : 0;
+
+   // Chot loi tung lenh A neu dat 2% tai khoan
+   double tp_dollar = balance * TakeProfitA_Pct / 100.0;
+   CloseProfitablePositions(MagicA1,    tp_dollar);
+   CloseProfitablePositions(MagicA_DCA, tp_dollar);
+
+   // Neu lo vuot 40% -> dung DCA lenh A
+   if(loss_pct >= MaxLossA_Pct)
+   {
+      Print("SmartGrid: lenh A lo ", DoubleToString(loss_pct, 1), "% - dung DCA A.");
+      return;
+   }
+
+   // DCA lenh A theo luoi
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = 0; i < Max_A_Levels; i++)
+   {
+      if(g_A_grid[i].opened) continue;
+
+      bool trigger = false;
+      if(g_A1_direction == 1 && bid <= g_A_grid[i].price) trigger = true;
+      if(g_A1_direction == -1 && ask >= g_A_grid[i].price) trigger = true;
+
+      if(trigger)
+      {
+         OpenDCA_A(i);
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// Mo lenh DCA A
+//+------------------------------------------------------------------+
+void OpenDCA_A(int idx)
+{
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+
+   double lot = NormalizeLot(g_A_grid[idx].lot);
+
+   req.action  = TRADE_ACTION_DEAL;
+   req.symbol  = _Symbol;
+   req.volume  = lot;
+   req.magic   = MagicA_DCA;
+   req.comment = "SmartGrid A" + IntegerToString(idx + 2);
+
+   if(g_A1_direction == 1)
+   {
+      req.type  = ORDER_TYPE_BUY;
+      req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   }
+   else
+   {
+      req.type  = ORDER_TYPE_SELL;
+      req.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   }
+
+   if(!OrderSend(req, res)) { Print("SmartGrid: OpenDCA_A error ", GetLastError()); return; }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED)
+   { Print("SmartGrid: OpenDCA_A retcode ", res.retcode); return; }
+
+   g_A_grid[idx].opened = true;
+   g_A_dca_levels++;
+   Print("SmartGrid: mo lenh A DCA level ", idx + 2, " lot=", lot, " @ ", req.price);
+}
+
+//+------------------------------------------------------------------+
+// Kiem tra kich hoat lenh B
+//+------------------------------------------------------------------+
+void CheckTriggerLenhB()
+{
+   if(g_B_triggered) return;
+
+   double pip      = _Point * g_pip_points;
+   double trigger  = B_TriggerPips * pip;
+   double bid      = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask      = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   bool triggered = false;
+   if(g_A1_direction == 1 && bid <= g_A1_open_price - trigger) triggered = true;
+   if(g_A1_direction == -1 && ask >= g_A1_open_price + trigger) triggered = true;
+
+   if(triggered)
+   {
+      Print("SmartGrid: gia vuot ", B_TriggerPips, " pip tu A1 - kich hoat lenh B.");
+      g_B_triggered = true;
+      BuildB_Grid();
+      OpenNextB_Level();
+   }
+}
+
+//+------------------------------------------------------------------+
+// Xay dung luoi lenh B (nguoc chieu A)
+//+------------------------------------------------------------------+
+void BuildB_Grid()
+{
+   double pip      = _Point * g_pip_points;
+   double spacing  = (double)B_SpreadPips / (double)B_NumLevels * pip;
+   double start    = 0;
+
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   // Lenh B nguoc chieu A
+   // Neu A la BUY (gia dang giam) -> B la SELL, rai len tren gia hien tai
+   // Neu A la SELL (gia dang tang) -> B la BUY, rai xuong duoi gia hien tai
+   if(g_A1_direction == 1)
+      start = bid;
+   else
+      start = ask;
+
+   for(int i = 0; i < B_NumLevels; i++)
+   {
+      if(g_A1_direction == 1) // B la SELL, rai len
+         g_B_grid[i].price = start + (i * spacing);
+      else // B la BUY, rai xuong
+         g_B_grid[i].price = start - (i * spacing);
+
+      g_B_grid[i].lot    = NormalizeLot(LotB);
+      g_B_grid[i].opened = false;
+   }
+
+   Print("SmartGrid: da xay dung luoi B - ", B_NumLevels, " muc, spacing=",
+         DoubleToString(spacing / pip, 1), " pip.");
+}
+
+//+------------------------------------------------------------------+
+// Quan ly lenh B
+//+------------------------------------------------------------------+
+void ManageLenhB()
+{
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double tp_dollar = balance * TakeProfitB_Pct / 100.0;
+
+   // Chot loi tung lenh B khi dat 1.5%
+   CloseProfitablePositions(MagicB, tp_dollar);
+
+   // Kiem tra gioi han lo 30%
+   double pnl_b   = GetTotalPNL(MagicB);
+   double loss_pct = (pnl_b < 0) ? (MathAbs(pnl_b) / balance * 100.0) : 0;
+   if(loss_pct >= MaxLossB_Pct)
+   {
+      Print("SmartGrid: lenh B lo ", DoubleToString(loss_pct, 1), "% - dung mo them lenh B.");
+      return;
+   }
+
+   // Mo them lenh B theo luoi
+   OpenNextB_Level();
+}
+
+//+------------------------------------------------------------------+
+// Mo lenh B tiep theo trong luoi
+//+------------------------------------------------------------------+
+void OpenNextB_Level()
+{
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+
+   for(int i = 0; i < B_NumLevels; i++)
+   {
+      if(g_B_grid[i].opened) continue;
+
+      bool trigger = false;
+      if(g_A1_direction == 1 && ask >= g_B_grid[i].price) trigger = true;   // B=SELL, cho gia len
+      if(g_A1_direction == -1 && bid <= g_B_grid[i].price) trigger = true;  // B=BUY, cho gia xuong
+
+      if(i == 0) trigger = true; // Lenh B dau tien mo ngay
+
+      if(trigger && !g_B_grid[i].opened)
+      {
+         OpenB_Position(i);
+         break;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// Mo 1 lenh B
+//+------------------------------------------------------------------+
+void OpenB_Position(int idx)
+{
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+
+   double lot = NormalizeLot(g_B_grid[idx].lot);
+
+   req.action  = TRADE_ACTION_DEAL;
+   req.symbol  = _Symbol;
+   req.volume  = lot;
+   req.magic   = MagicB;
+   req.comment = "SmartGrid B" + IntegerToString(idx + 1);
+
+   // Lenh B nguoc chieu A
+   if(g_A1_direction == 1) // A=BUY -> B=SELL
+   {
+      req.type  = ORDER_TYPE_SELL;
+      req.price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   }
+   else // A=SELL -> B=BUY
+   {
+      req.type  = ORDER_TYPE_BUY;
+      req.price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   }
+
+   if(!OrderSend(req, res)) { Print("SmartGrid: OpenB error ", GetLastError()); return; }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED)
+   { Print("SmartGrid: OpenB retcode ", res.retcode); return; }
+
+   g_B_grid[idx].opened = true;
+   g_B_levels_opened++;
+   Print("SmartGrid: mo lenh B", idx + 1, " lot=", lot, " @ ", req.price);
+}
+
+//+------------------------------------------------------------------+
+// Can bang: khi lenh A lo 40% -> mo them lenh B de can tai khoan
+//+------------------------------------------------------------------+
+void CheckBalanceHedge()
+{
+   double balance  = AccountInfoDouble(ACCOUNT_BALANCE);
+   double pnl_a    = GetTotalPNL(MagicA1) + GetTotalPNL(MagicA_DCA);
+   double loss_pct = (pnl_a < 0) ? (MathAbs(pnl_a) / balance * 100.0) : 0;
+
+   if(loss_pct < MaxLossA_Pct) return;
+
+   // Kiem tra ton tai lenh B chua
+   int b_count = CountPositions(MagicB);
+   if(b_count >= B_NumLevels) return;
+
+   // Kiem tra gioi han lo 30% lenh B
+   double pnl_b    = GetTotalPNL(MagicB);
+   double loss_b   = (pnl_b < 0) ? (MathAbs(pnl_b) / balance * 100.0) : 0;
+   if(loss_b >= MaxLossB_Pct) return;
+
+   // Mo them 1 lenh B de can bang
+   Print("SmartGrid: lenh A lo ", DoubleToString(loss_pct, 1), "% - mo them lenh B can bang.");
+
+   if(!g_B_triggered)
+   {
+      g_B_triggered = true;
+      BuildB_Grid();
+   }
+   OpenNextB_Level();
+}
+
+//+------------------------------------------------------------------+
+// Dong tung lenh dat % loi nhuan
+//+------------------------------------------------------------------+
+void CloseProfitablePositions(const int magic, const double tp_dollar)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
+
+      double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+      if(profit >= tp_dollar)
+      {
+         if(!trade.PositionClose(ticket))
+            Print("SmartGrid: dong lenh #", ticket, " that bai.");
+         else
+            Print("SmartGrid: chot loi lenh #", ticket, " profit=", DoubleToString(profit, 2));
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+double GetTotalPNL(const int magic)
+{
+   double pnl = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      pnl += PositionGetDouble(POSITION_PROFIT);
+      pnl += PositionGetDouble(POSITION_SWAP);
+   }
+   return pnl;
+}
+
+//+------------------------------------------------------------------+
+int CountPositions(const int magic)
+{
+   int count = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != magic) continue;
+      count++;
+   }
+   return count;
+}
+
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lot < min_lot) lot = min_lot;
+   if(lot > max_lot) lot = max_lot;
+   return NormalizeDouble(MathRound(lot / lot_step) * lot_step, 2);
+}
+//+------------------------------------------------------------------+
