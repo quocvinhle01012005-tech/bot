@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //| SimpleGrid.mq5                                                   |
-//| Lot 0.01 / TP $10 / SL $4 / BE khi profit $5 / DCA 2phut / x5  |
+//| Lot 0.01 / TP $10 / SL $4 / BE doi SL ve +$0.20 khi profit $5  |
 //+------------------------------------------------------------------+
 #property copyright "SimpleGrid"
-#property version   "1.06"
+#property version   "1.07"
 
 #include <Trade/Trade.mqh>
 
@@ -23,7 +23,8 @@ input int    DCA_IntervalMin = 2;     // Khoang cach thoi gian DCA (phut)
 input group "=== TP / SL / BREAKEVEN ==="
 input double TP_Dollar       = 10.0; // Chot loi moi lenh ($)
 input double SL_Dollar       = 4.0;  // Cat lo moi lenh ($)
-input double BE_Dollar       = 5.0;  // Doi SL hoa von khi profit dat ($)
+input double BE_TriggerDollar = 5.0; // Doi SL khi profit dat ($)
+input double BE_LockDollar   = 0.20; // Doi SL ve muc loi nhuan toi thieu ($)
 
 input group "=== SYSTEM ==="
 input int    BuyMagicNumber  = 666666;
@@ -123,7 +124,7 @@ double PipSize()
 }
 
 //+------------------------------------------------------------------+
-// Tinh so pip tuong duong voi X dollar voi lot hien tai
+// Tinh so pip tuong duong voi X dollar voi lot cu the
 //+------------------------------------------------------------------+
 double DollarToPip(double dollar, double lot)
 {
@@ -162,8 +163,6 @@ void ResetGrid(GridLevel &grid[])
    }
 }
 
-//+------------------------------------------------------------------+
-// Dong bo trang thai grid voi vi tri thuc te
 //+------------------------------------------------------------------+
 void SyncGridState(GridLevel &grid[], int magic, long pos_type, int &count)
 {
@@ -213,10 +212,17 @@ void ManageTpSlByDollar(GridLevel &grid[], long pos_type)
 }
 
 //+------------------------------------------------------------------+
-// Breakeven: khi profit >= BE_Dollar -> doi SL ve gia mo lenh
+// Breakeven: khi profit >= BE_TriggerDollar
+// -> doi SL ve muc gia dam bao con loi BE_LockDollar ($0.20)
 //+------------------------------------------------------------------+
 void ManageBreakeven(GridLevel &grid[], long pos_type)
 {
+   double lot     = NormalizeLot(LotSize);
+   double pip     = PipSize();
+
+   // So pip tuong duong voi BE_LockDollar ($0.20)
+   double lock_pip = DollarToPip(BE_LockDollar, lot);
+
    for(int i = 0; i < Max_Grid_Levels; i++)
    {
       if(!grid[i].is_open || grid[i].be_moved) continue;
@@ -228,15 +234,21 @@ void ManageBreakeven(GridLevel &grid[], long pos_type)
       double cur_tp  = PositionGetDouble(POSITION_TP);
       double open_p  = grid[i].open_price;
 
-      // Chi doi SL khi profit dat BE_Dollar
-      if(profit < BE_Dollar) continue;
+      // Chi xu ly khi profit dat nguong trigger
+      if(profit < BE_TriggerDollar) continue;
 
-      double new_sl = NormalizeDouble(open_p, _Digits);
+      // Tinh gia SL moi = gia mo + lock_pip (dam bao loi $0.20 neu bi dong)
+      double new_sl = 0;
+      if(pos_type == POSITION_TYPE_BUY)
+         new_sl = NormalizeDouble(open_p + lock_pip * pip, _Digits);
+      else
+         new_sl = NormalizeDouble(open_p - lock_pip * pip, _Digits);
 
-      // Khong doi neu SL da o hoa von roi
-      if(MathAbs(new_sl - cur_sl) <= _Point) continue;
+      // Khong doi neu SL cu da tot hon hoac bang
+      if(pos_type == POSITION_TYPE_BUY  && new_sl <= cur_sl) continue;
+      if(pos_type == POSITION_TYPE_SELL && new_sl >= cur_sl) continue;
 
-      // Kiem tra SL moi hop le (khong dat qua TP)
+      // Kiem tra SL moi hop le (khong vuot qua TP)
       bool valid = false;
       if(pos_type == POSITION_TYPE_BUY  && new_sl < cur_tp) valid = true;
       if(pos_type == POSITION_TYPE_SELL && new_sl > cur_tp) valid = true;
@@ -248,14 +260,12 @@ void ManageBreakeven(GridLevel &grid[], long pos_type)
             grid[i].be_moved = true;
             Print("SG: BE lenh #", grid[i].ticket,
                   " profit=$", DoubleToString(profit, 2),
-                  " SL doi ve hoa von @ ", new_sl);
+                  " SL doi ve +$", BE_LockDollar, " @ ", new_sl);
          }
       }
    }
 }
 
-//+------------------------------------------------------------------+
-// Mo lenh DCA theo timer
 //+------------------------------------------------------------------+
 void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
                    int &count, datetime &last_open_time)
@@ -268,7 +278,6 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
       if((int)(now - last_open_time) < DCA_IntervalMin * 60) return;
    }
 
-   // Tim slot trong
    int slot = -1;
    for(int i = 0; i < Max_Grid_Levels; i++)
    {
@@ -329,8 +338,10 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
 
    Print("SG: mo lenh ", req.comment,
          " lot=", lot, " @ ", price,
-         " TP=$", TP_Dollar, " SL=$", SL_Dollar,
-         " BE khi profit=$", BE_Dollar);
+         " TP=$", TP_Dollar,
+         " SL=$", SL_Dollar,
+         " BE trigger=$", BE_TriggerDollar,
+         " BE lock=$", BE_LockDollar);
 }
 
 //+------------------------------------------------------------------+
