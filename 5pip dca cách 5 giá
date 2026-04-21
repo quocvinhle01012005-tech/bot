@@ -1,9 +1,9 @@
 //+------------------------------------------------------------------+
 //| SimpleGrid.mq5                                                   |
-//| Lot 0.01 / TP $10 / SL $4 / BE +$0.20 / DCA 2min + 4pip        |
+//| Lot 0.01 / TP $10 / SL $4 / BE +$0.20 / DCA 2min+4pip / TP $20 |
 //+------------------------------------------------------------------+
 #property copyright "SimpleGrid"
-#property version   "1.09"
+#property version   "1.10"
 
 #include <Trade/Trade.mqh>
 
@@ -18,14 +18,15 @@ input group "=== TRADING CONFIGURATION ==="
 input ENUM_TRADING_DIRECTION TradingDirection = DIRECTION_BOTH;
 input double LotSize          = 0.01;
 input int    Max_Grid_Levels  = 5;
-input int    DCA_IntervalMin  = 2;    // Khoang cach thoi gian DCA (phut)
-input int    DCA_PipDistance  = 4;    // Khoang cach gia giua 2 lenh DCA (pip)
+input int    DCA_IntervalMin  = 2;
+input int    DCA_PipDistance  = 4;
 
 input group "=== TP / SL / BREAKEVEN ==="
-input double TP_Dollar        = 10.0;
-input double SL_Dollar        = 4.0;
-input double BE_TriggerDollar = 5.0;
-input double BE_LockDollar    = 0.20;
+input double TP_Dollar        = 10.0;  // Chot loi moi lenh ($)
+input double SL_Dollar        = 4.0;   // Cat lo moi lenh ($)
+input double BE_TriggerDollar = 5.0;   // Doi SL khi profit dat ($)
+input double BE_LockDollar    = 0.20;  // Khoa lai toi thieu khi doi SL ($)
+input double TotalTP_Dollar   = 20.0;  // Dong TOAN BO lenh khi tong profit dat ($)
 
 input group "=== SYSTEM ==="
 input int    BuyMagicNumber   = 666666;
@@ -57,12 +58,10 @@ bool       sell_grid_active   = false;
 
 datetime   g_last_buy_open    = 0;
 datetime   g_last_sell_open   = 0;
-double     g_last_buy_price   = 0;  // Gia mo lenh buy cuoi cung
-double     g_last_sell_price  = 0;  // Gia mo lenh sell cuoi cung
+double     g_last_buy_price   = 0;
+double     g_last_sell_price  = 0;
 
-int        g_count_tp = 0;
-int        g_count_sl = 0;
-int        g_count_be = 0;
+int        g_total_orders     = 0;  // Tong so lenh da mo ke tu khi bat bot
 
 CTrade     trade;
 int        g_pip_points = 10;
@@ -88,6 +87,8 @@ int OnInit()
    trade.SetDeviationInPoints(DeviationPoints);
    trade.SetTypeFillingBySymbol(_Symbol);
 
+   g_total_orders = 0;
+
    CreateOrUpdateButtons();
    CreateStatsLabel();
    return INIT_SUCCEEDED;
@@ -107,13 +108,16 @@ void OnDeinit(const int reason)
 //+------------------------------------------------------------------+
 void OnTick()
 {
+   // Kiem tra tong profit dat $20 -> dong tat ca
+   CheckTotalTakeProfit();
+
    if(buy_grid_active)
    {
       SyncGridState(buy_grid,  BuyMagicNumber,  POSITION_TYPE_BUY,  active_buy_levels);
       ManageBreakeven(buy_grid,  POSITION_TYPE_BUY);
       ManageTpSlByDollar(buy_grid,  POSITION_TYPE_BUY);
       DCA_TimerOpen(buy_grid,  BuyMagicNumber,  1,  active_buy_levels,
-                    g_last_buy_open, g_last_buy_price);
+                    g_last_buy_open,  g_last_buy_price);
    }
    if(sell_grid_active)
    {
@@ -123,8 +127,44 @@ void OnTick()
       DCA_TimerOpen(sell_grid, SellMagicNumber, -1, active_sell_levels,
                     g_last_sell_open, g_last_sell_price);
    }
+
    UpdateButtonAppearance();
    UpdateStatsLabel();
+}
+
+//+------------------------------------------------------------------+
+// Tinh tong floating PNL tat ca lenh dang mo (ca buy + sell)
+//+------------------------------------------------------------------+
+double GetTotalFloatingPNL()
+{
+   double total = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      long magic = PositionGetInteger(POSITION_MAGIC);
+      if(magic != BuyMagicNumber && magic != SellMagicNumber) continue;
+      total += PositionGetDouble(POSITION_PROFIT);
+      total += PositionGetDouble(POSITION_SWAP);
+   }
+   return total;
+}
+
+//+------------------------------------------------------------------+
+// Dong toan bo lenh khi tong profit dat TotalTP_Dollar
+//+------------------------------------------------------------------+
+void CheckTotalTakeProfit()
+{
+   if(!buy_grid_active && !sell_grid_active) return;
+
+   double total_pnl = GetTotalFloatingPNL();
+   if(total_pnl < TotalTP_Dollar) return;
+
+   Print("SG: TONG PROFIT $", DoubleToString(total_pnl, 2),
+         " dat muc $", TotalTP_Dollar, " - dong tat ca lenh!");
+   CloseAllBuyPositions();
+   CloseAllSellPositions();
 }
 
 //+------------------------------------------------------------------+
@@ -179,7 +219,6 @@ void SyncGridState(GridLevel &grid[], int magic, long pos_type, int &count)
          count++;
       else
       {
-         Print("SG: lenh #", grid[i].ticket, " da dong - slot ", i, " trong.");
          grid[i].is_open    = false;
          grid[i].ticket     = 0;
          grid[i].be_moved   = false;
@@ -201,14 +240,12 @@ void ManageTpSlByDollar(GridLevel &grid[], long pos_type)
 
       if(profit >= TP_Dollar)
       {
-         Print("SG: TP lenh #", grid[i].ticket, " $", DoubleToString(profit, 2));
-         if(trade.PositionClose(grid[i].ticket)) g_count_tp++;
+         Print("SG: TP #", grid[i].ticket, " $", DoubleToString(profit, 2));
+         trade.PositionClose(grid[i].ticket);
       }
       else if(profit <= -SL_Dollar)
       {
-         Print("SG: SL lenh #", grid[i].ticket, " $", DoubleToString(profit, 2));
-         if(grid[i].be_moved) g_count_be++;
-         else                 g_count_sl++;
+         Print("SG: SL #", grid[i].ticket, " $", DoubleToString(profit, 2));
          trade.PositionClose(grid[i].ticket);
       }
    }
@@ -249,16 +286,12 @@ void ManageBreakeven(GridLevel &grid[], long pos_type)
       if(valid && trade.PositionModify(grid[i].ticket, new_sl, cur_tp))
       {
          grid[i].be_moved = true;
-         Print("SG: BE lenh #", grid[i].ticket,
+         Print("SG: BE #", grid[i].ticket,
                " SL doi ve +$", BE_LockDollar, " @ ", new_sl);
       }
    }
 }
 
-//+------------------------------------------------------------------+
-// Mo lenh DCA: can ca 2 dieu kien
-//   1. Du thoi gian (DCA_IntervalMin phut)
-//   2. Gia hien tai cach gia lenh truoc >= DCA_PipDistance pip
 //+------------------------------------------------------------------+
 void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
                    int &count, datetime &last_open_time, double &last_open_price)
@@ -271,7 +304,7 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
    if(last_open_time != 0)
       if((int)(now - last_open_time) < DCA_IntervalMin * 60) return;
 
-   // Dieu kien 2: gia cach lenh truoc >= DCA_PipDistance pip
+   // Dieu kien 2: gia cach lenh truoc >= DCA_PipDistance pip (bat ke len hay xuong)
    double pip      = PipSize();
    double min_dist = DCA_PipDistance * pip;
 
@@ -280,12 +313,7 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
       double cur_price = (direction == 1)
                          ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                          : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      double dist = MathAbs(cur_price - last_open_price);
-      if(dist < min_dist)
-      {
-         // Chua du khoang cach, khong mo
-         return;
-      }
+      if(MathAbs(cur_price - last_open_price) < min_dist) return;
    }
 
    // Tim slot trong
@@ -336,10 +364,11 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
    last_open_time        = now;
    last_open_price       = price;
    count++;
+   g_total_orders++;  // Dem tong lenh da mo
 
    Print("SG: mo ", req.comment, " @ ", price,
          " TP=$", TP_Dollar, " SL=$", SL_Dollar,
-         " (cach lenh truoc ", DoubleToString(MathAbs(price - last_open_price) / pip, 1), " pip)");
+         " | Tong lenh: ", g_total_orders);
 }
 
 //+------------------------------------------------------------------+
@@ -405,17 +434,21 @@ void CreateStatsLabel()
    ObjectSetInteger(0, LBL_STATS, OBJPROP_FONTSIZE,   9);
    ObjectSetString(0,  LBL_STATS, OBJPROP_FONT,       "Arial Bold");
    ObjectSetInteger(0, LBL_STATS, OBJPROP_SELECTABLE, false);
-   ObjectSetString(0,  LBL_STATS, OBJPROP_TEXT,       "TP:0  SL:0  Hoa:0");
+   ObjectSetString(0,  LBL_STATS, OBJPROP_TEXT,       "Lenh: 0 | P&L: $0.00");
 }
 
 //+------------------------------------------------------------------+
 void UpdateStatsLabel()
 {
    if(ObjectFind(0, LBL_STATS) < 0) CreateStatsLabel();
-   string txt = "TP:" + IntegerToString(g_count_tp)
-              + "  SL:" + IntegerToString(g_count_sl)
-              + "  Hoa:" + IntegerToString(g_count_be);
+   double pnl = GetTotalFloatingPNL();
+   string pnl_str = (pnl >= 0 ? "+" : "") + DoubleToString(pnl, 2);
+   string txt = "Lenh: " + IntegerToString(g_total_orders)
+              + " | P&L: $" + pnl_str;
    ObjectSetString(0, LBL_STATS, OBJPROP_TEXT, txt);
+   // Doi mau theo loi/lo
+   color c = (pnl > 0) ? clrLime : (pnl < 0 ? clrRed : clrYellow);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_COLOR, c);
 }
 
 //+------------------------------------------------------------------+
@@ -448,9 +481,7 @@ void OnChartEvent(const int id, const long &lparam, const double &dparam, const 
       ObjectSetInteger(0, BTN_CLOSE_ALL, OBJPROP_STATE, false);
       CloseAllBuyPositions();
       CloseAllSellPositions();
-      g_count_tp = 0;
-      g_count_sl = 0;
-      g_count_be = 0;
+      g_total_orders = 0;  // Reset dem khi dong tat ca
    }
 
    UpdateButtonAppearance();
