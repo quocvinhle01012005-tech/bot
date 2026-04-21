@@ -1,0 +1,187 @@
+//+------------------------------------------------------------------+
+//| EMA + DCA BOT + UI BUTTONS                                       |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+// ===== INPUT =====
+input double Lot = 0.01;
+input int MaxOrders = 4;
+input double DCA_Distance = 5.0;
+input double TotalTP = 5.0;
+input double MaxDrawdown = 20.0;
+
+input int EMA_Fast = 50;
+input int EMA_Slow = 200;
+
+// ===== GLOBAL =====
+double lastEntryPrice = 0;
+bool autoTrading = true;
+
+//+------------------------------------------------------------------+
+//| CREATE BUTTON                                                    |
+//+------------------------------------------------------------------+
+void CreateButton(string name, int x, int y, int w, int h)
+{
+   ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE, x);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE, y);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE, w);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE, h);
+   ObjectSetString(0, name, OBJPROP_TEXT, name);
+}
+
+//+------------------------------------------------------------------+
+//| INIT                                                             |
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   CreateButton("BUY", 15, 35, 70, 25);
+   CreateButton("SELL", 95, 35, 70, 25);
+   CreateButton("CLOSE", 15, 70, 150, 25);
+   CreateButton("AUTO", 15, 105, 150, 25);
+
+   return(INIT_SUCCEEDED);
+}
+
+//+------------------------------------------------------------------+
+//| HANDLE BUTTON CLICK                                              |
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id,
+                  const long &lparam,
+                  const double &dparam,
+                  const string &sparam)
+{
+   if(id == CHARTEVENT_OBJECT_CLICK)
+   {
+      if(sparam == "BUY")
+         trade.Buy(Lot);
+
+      if(sparam == "SELL")
+         trade.Sell(Lot);
+
+      if(sparam == "CLOSE")
+         CloseAll();
+
+      if(sparam == "AUTO")
+         autoTrading = !autoTrading;
+   }
+}
+
+//+------------------------------------------------------------------+
+//| EMA                                                              |
+//+------------------------------------------------------------------+
+double GetEMA(int period)
+{
+   return iMA(_Symbol, PERIOD_CURRENT, period, 0, MODE_EMA, PRICE_CLOSE);
+}
+
+//+------------------------------------------------------------------+
+//| COUNT ORDERS                                                     |
+//+------------------------------------------------------------------+
+int CountOrders()
+{
+   int total = 0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol)
+         total++;
+   }
+   return total;
+}
+
+//+------------------------------------------------------------------+
+//| TOTAL PROFIT                                                     |
+//+------------------------------------------------------------------+
+double TotalProfit()
+{
+   double profit = 0;
+   for(int i=0;i<PositionsTotal();i++)
+   {
+      if(PositionGetSymbol(i) == _Symbol)
+         profit += PositionGetDouble(POSITION_PROFIT);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+//| CLOSE ALL                                                        |
+//+------------------------------------------------------------------+
+void CloseAll()
+{
+   for(int i=PositionsTotal()-1;i>=0;i--)
+   {
+      if(PositionGetSymbol(i) == _Symbol)
+      {
+         ulong ticket = PositionGetTicket(i);
+         trade.PositionClose(ticket);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+//| MAIN LOGIC                                                       |
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   if(!autoTrading) return;
+
+   double emaFast = GetEMA(EMA_Fast);
+   double emaSlow = GetEMA(EMA_Slow);
+   double price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+
+   int orders = CountOrders();
+
+   // ===== CẮT LỖ TÀI KHOẢN =====
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity = AccountInfoDouble(ACCOUNT_EQUITY);
+
+   if((balance - equity) / balance * 100 >= MaxDrawdown)
+   {
+      CloseAll();
+      return;
+   }
+
+   // ===== CHỐT LỜI TỔNG =====
+   if(TotalProfit() >= TotalTP)
+   {
+      CloseAll();
+      return;
+   }
+
+   // ===== ENTRY =====
+   if(orders == 0)
+   {
+      if(emaFast > emaSlow)
+      {
+         trade.Buy(Lot);
+         lastEntryPrice = price;
+      }
+      else if(emaFast < emaSlow)
+      {
+         trade.Sell(Lot);
+         lastEntryPrice = price;
+      }
+      return;
+   }
+
+   // ===== DCA =====
+   if(orders < MaxOrders)
+   {
+      double distance = MathAbs(price - lastEntryPrice);
+
+      if(distance >= DCA_Distance)
+      {
+         if(emaFast > emaSlow)
+         {
+            trade.Buy(Lot);
+            lastEntryPrice = price;
+         }
+         else if(emaFast < emaSlow)
+         {
+            trade.Sell(Lot);
+            lastEntryPrice = price;
+         }
+      }
+   }
+}
