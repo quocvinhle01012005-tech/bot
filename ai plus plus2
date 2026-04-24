@@ -1,13 +1,14 @@
 //+------------------------------------------------------------------+
 //| EMA + DCA BOT + UI BUTTONS                                       |
+//| DCA chi khi gia di nguoc lenh, khong trung vung gia              |
 //+------------------------------------------------------------------+
 #include <Trade/Trade.mqh>
 CTrade trade;
 
 input double Lot          = 0.01;
 input int    MaxOrders    = 80;
-input double DCA_Distance = 5.0;
-input double TP_PerOrder  = 5.0;
+input double DCA_Distance = 5.0;   // Khoang cach DCA (gia)
+input double TP_PerOrder  = 5.0;   // Chot loi: so_lenh x TP_PerOrder
 input double MaxDrawdown  = 20.0;
 input int    EMA_Fast     = 50;
 input int    EMA_Slow     = 200;
@@ -21,7 +22,6 @@ input int    ButtonWidth     = 150;
 input int    ButtonHeight    = 28;
 input int    ButtonGap       = 4;
 
-double lastEntryPrice = 0;
 int    g_total_orders = 0;
 
 const string BTN_BUY        = "EMA_BtnBuy";
@@ -31,6 +31,7 @@ const string BTN_CLOSE_SELL = "EMA_BtnCloseSell";
 const string BTN_CLOSE_ALL  = "EMA_BtnCloseAll";
 const string LBL_STATS      = "EMA_LblStats";
 
+//+------------------------------------------------------------------+
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
@@ -50,16 +51,62 @@ void OnDeinit(const int reason)
    ObjectDelete(0, LBL_STATS);
 }
 
+//+------------------------------------------------------------------+
+// Kiem tra gia hien tai co qua gan bat ky lenh nao dang mo khong
+// Tra ve true neu OK mo lenh moi (khong trung vung gia)
+//+------------------------------------------------------------------+
+bool IsPriceZoneClear(double new_price, long pos_type)
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+
+      double open_price = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(MathAbs(new_price - open_price) < DCA_Distance)
+         return false; // Trung vung gia
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+// Lay gia trung binh cua tat ca lenh cung loai
+//+------------------------------------------------------------------+
+double GetAvgEntryPrice(long pos_type)
+{
+   double total_price = 0;
+   int    count       = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+      total_price += PositionGetDouble(POSITION_PRICE_OPEN);
+      count++;
+   }
+   return (count > 0) ? total_price / count : 0;
+}
+
+//+------------------------------------------------------------------+
 void OnTick()
 {
    double balance = AccountInfoDouble(ACCOUNT_BALANCE);
    double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
    double profit  = TotalProfit();
-   double price   = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
    double emaFast = GetEMA(EMA_Fast);
    double emaSlow = GetEMA(EMA_Slow);
    int    orders  = CountOrders();
+   int    buys    = CountByType(POSITION_TYPE_BUY);
+   int    sells   = CountByType(POSITION_TYPE_SELL);
 
+   // Cat lo
    if(balance > 0 && (balance - equity) / balance * 100.0 >= MaxDrawdown)
    {
       CloseAll();
@@ -68,13 +115,15 @@ void OnTick()
       return;
    }
 
+   // Chot loi: profit >= so_lenh x TP_PerOrder
    if(orders > 0)
    {
       double tp_target = orders * TP_PerOrder;
       if(profit >= tp_target)
       {
          Print("EMA: Chot loi $", DoubleToString(profit,2),
-               " (", orders, " lenh x $", TP_PerOrder, " = $", DoubleToString(tp_target,2), ")");
+               " (", orders, " lenh x $", TP_PerOrder,
+               " = $", DoubleToString(tp_target,2), ")");
          CloseAll();
          g_total_orders = 0;
          RefreshUI();
@@ -82,47 +131,85 @@ void OnTick()
       }
    }
 
+   // Vao lenh dau tien
    if(orders == 0)
    {
       if(emaFast > emaSlow)
       {
          trade.Buy(Lot);
-         lastEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
          g_total_orders++;
       }
       else if(emaFast < emaSlow)
       {
          trade.Sell(Lot);
-         lastEntryPrice = price;
          g_total_orders++;
       }
       RefreshUI();
       return;
    }
 
-   if(orders < MaxOrders)
+   // DCA lenh BUY: chi khi gia XUONG (nguoc lenh buy) >= DCA_Distance
+   // va khong trung vung gia bat ky lenh buy nao
+   if(buys > 0 && buys < MaxOrders && emaFast > emaSlow)
    {
-      double dist = MathAbs(price - lastEntryPrice);
-      if(dist >= DCA_Distance)
+      // Gia hien tai phai THAP hon tat ca lenh buy da mo it nhat DCA_Distance
+      // Tim lenh buy thap nhat
+      double lowest_buy = 999999;
+      for(int i = 0; i < PositionsTotal(); i++)
       {
-         if(emaFast > emaSlow)
-         {
-            trade.Buy(Lot);
-            lastEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
-            g_total_orders++;
-         }
-         else if(emaFast < emaSlow)
-         {
-            trade.Sell(Lot);
-            lastEntryPrice = price;
-            g_total_orders++;
-         }
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+         if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_BUY) continue;
+         double op = PositionGetDouble(POSITION_PRICE_OPEN);
+         if(op < lowest_buy) lowest_buy = op;
+      }
+
+      // Chi DCA khi:
+      // 1. Gia dang DUOI lenh buy thap nhat (di nguoc = giam)
+      // 2. Cach lenh thap nhat >= DCA_Distance
+      // 3. Khong trung vung gia bat ky lenh nao
+      if(bid < lowest_buy - DCA_Distance && IsPriceZoneClear(ask, POSITION_TYPE_BUY))
+      {
+         trade.Buy(Lot);
+         g_total_orders++;
+         Print("EMA: DCA BUY @ ", ask, " (lenh buy thap nhat=", lowest_buy, ")");
+      }
+   }
+
+   // DCA lenh SELL: chi khi gia LEN (nguoc lenh sell) >= DCA_Distance
+   if(sells > 0 && sells < MaxOrders && emaFast < emaSlow)
+   {
+      // Tim lenh sell cao nhat
+      double highest_sell = 0;
+      for(int i = 0; i < PositionsTotal(); i++)
+      {
+         ulong ticket = PositionGetTicket(i);
+         if(ticket == 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+         if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_SELL) continue;
+         double op = PositionGetDouble(POSITION_PRICE_OPEN);
+         if(op > highest_sell) highest_sell = op;
+      }
+
+      // Chi DCA khi:
+      // 1. Gia dang TREN lenh sell cao nhat (di nguoc = tang)
+      // 2. Cach lenh cao nhat >= DCA_Distance
+      // 3. Khong trung vung gia bat ky lenh nao
+      if(ask > highest_sell + DCA_Distance && IsPriceZoneClear(bid, POSITION_TYPE_SELL))
+      {
+         trade.Sell(Lot);
+         g_total_orders++;
+         Print("EMA: DCA SELL @ ", bid, " (lenh sell cao nhat=", highest_sell, ")");
       }
    }
 
    RefreshUI();
 }
 
+//+------------------------------------------------------------------+
 void OnChartEvent(const int id, const long &lparam,
                   const double &dparam, const string &sparam)
 {
@@ -132,14 +219,12 @@ void OnChartEvent(const int id, const long &lparam,
    {
       ObjectSetInteger(0, BTN_BUY, OBJPROP_STATE, false);
       trade.Buy(Lot);
-      lastEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
       g_total_orders++;
    }
    else if(sparam == BTN_SELL)
    {
       ObjectSetInteger(0, BTN_SELL, OBJPROP_STATE, false);
       trade.Sell(Lot);
-      lastEntryPrice = SymbolInfoDouble(_Symbol, SYMBOL_BID);
       g_total_orders++;
    }
    else if(sparam == BTN_CLOSE_BUY)
@@ -162,6 +247,7 @@ void OnChartEvent(const int id, const long &lparam,
    RefreshUI();
 }
 
+//+------------------------------------------------------------------+
 double GetEMA(int period)
 {
    int handle = iMA(_Symbol, PERIOD_CURRENT, period, 0, MODE_EMA, PRICE_CLOSE);
