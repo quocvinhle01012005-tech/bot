@@ -1,0 +1,427 @@
+//+------------------------------------------------------------------+
+//| EMA + DCA BOT + UI BUTTONS                                       |
+//| Chot loi rieng tung chieu: BUY va SELL doc lap                   |
+//+------------------------------------------------------------------+
+#include <Trade/Trade.mqh>
+CTrade trade;
+
+input double Lot          = 0.01;
+input int    MaxOrders    = 80;
+input double DCA_Distance = 5.0;
+input double TP_PerOrder  = 5.0;   // Chot loi moi lenh $X (tinh rieng tung chieu)
+input double MaxDrawdown  = 20.0;
+input int    EMA_Fast     = 50;
+input int    EMA_Slow     = 200;
+input int    MagicNumber  = 123456;
+
+input group "=== CHART BUTTONS ==="
+input bool   ButtonCornerTop = true;
+input int    ButtonOffsetX   = 12;
+input int    ButtonOffsetY   = 28;
+input int    ButtonWidth     = 150;
+input int    ButtonHeight    = 28;
+input int    ButtonGap       = 4;
+
+int  g_total_orders = 0;
+bool g_buy_opened   = false;
+bool g_sell_opened  = false;
+
+const string BTN_BUY        = "EMA_BtnBuy";
+const string BTN_CLOSE_BUY  = "EMA_BtnCloseBuy";
+const string BTN_SELL       = "EMA_BtnSell";
+const string BTN_CLOSE_SELL = "EMA_BtnCloseSell";
+const string BTN_CLOSE_ALL  = "EMA_BtnCloseAll";
+const string LBL_STATS      = "EMA_LblStats";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   trade.SetExpertMagicNumber(MagicNumber);
+   g_total_orders = 0;
+   g_buy_opened   = false;
+   g_sell_opened  = false;
+   CreateButtons();
+   CreateStatsLabel();
+   return INIT_SUCCEEDED;
+}
+
+void OnDeinit(const int reason)
+{
+   ObjectDelete(0, BTN_BUY);
+   ObjectDelete(0, BTN_CLOSE_BUY);
+   ObjectDelete(0, BTN_SELL);
+   ObjectDelete(0, BTN_CLOSE_SELL);
+   ObjectDelete(0, BTN_CLOSE_ALL);
+   ObjectDelete(0, LBL_STATS);
+}
+
+//+------------------------------------------------------------------+
+bool IsPriceZoneClear(double new_price, long pos_type)
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+      double op = PositionGetDouble(POSITION_PRICE_OPEN);
+      if(MathAbs(new_price - op) < DCA_Distance) return false;
+   }
+   return true;
+}
+
+//+------------------------------------------------------------------+
+// Tinh tong profit rieng theo chieu
+//+------------------------------------------------------------------+
+double ProfitByType(long pos_type)
+{
+   double profit = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+      profit += PositionGetDouble(POSITION_PROFIT);
+      profit += PositionGetDouble(POSITION_SWAP);
+   }
+   return profit;
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
+   double equity  = AccountInfoDouble(ACCOUNT_EQUITY);
+   double bid     = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double ask     = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double emaFast = GetEMA(EMA_Fast);
+   double emaSlow = GetEMA(EMA_Slow);
+   int    buys    = CountByType(POSITION_TYPE_BUY);
+   int    sells   = CountByType(POSITION_TYPE_SELL);
+   int    orders  = buys + sells;
+
+   // Reset neu het lenh
+   if(buys  == 0) g_buy_opened  = false;
+   if(sells == 0) g_sell_opened = false;
+
+   // Cat lo toan tai khoan
+   if(balance > 0 && (balance - equity) / balance * 100.0 >= MaxDrawdown)
+   {
+      CloseAll();
+      g_total_orders = 0;
+      g_buy_opened   = false;
+      g_sell_opened  = false;
+      RefreshUI();
+      return;
+   }
+
+   // Chot loi BUY rieng: profit BUY >= so lenh BUY x TP_PerOrder
+   if(buys > 0)
+   {
+      double buy_profit = ProfitByType(POSITION_TYPE_BUY);
+      double buy_target = buys * TP_PerOrder;
+      if(buy_profit >= buy_target)
+      {
+         Print("EMA: Chot loi BUY $", DoubleToString(buy_profit,2),
+               " (", buys, " lenh x $", TP_PerOrder, " = $", DoubleToString(buy_target,2), ")");
+         CloseByType(POSITION_TYPE_BUY);
+         g_buy_opened = false;
+      }
+   }
+
+   // Chot loi SELL rieng: profit SELL >= so lenh SELL x TP_PerOrder
+   if(sells > 0)
+   {
+      double sell_profit = ProfitByType(POSITION_TYPE_SELL);
+      double sell_target = sells * TP_PerOrder;
+      if(sell_profit >= sell_target)
+      {
+         Print("EMA: Chot loi SELL $", DoubleToString(sell_profit,2),
+               " (", sells, " lenh x $", TP_PerOrder, " = $", DoubleToString(sell_target,2), ")");
+         CloseByType(POSITION_TYPE_SELL);
+         g_sell_opened = false;
+      }
+   }
+
+   // Cap nhat lai sau khi co the da dong lenh
+   buys  = CountByType(POSITION_TYPE_BUY);
+   sells = CountByType(POSITION_TYPE_SELL);
+
+   // ===== XU LY BUY DOC LAP =====
+   if(emaFast > emaSlow)
+   {
+      if(!g_buy_opened)
+      {
+         trade.Buy(Lot);
+         g_buy_opened = true;
+         g_total_orders++;
+         Print("EMA: Mo BUY dau tien @ ", ask);
+      }
+      else if(buys > 0 && buys < MaxOrders)
+      {
+         double lowest_buy = 999999;
+         for(int i = 0; i < PositionsTotal(); i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_BUY) continue;
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(op < lowest_buy) lowest_buy = op;
+         }
+         if(bid < lowest_buy - DCA_Distance && IsPriceZoneClear(ask, POSITION_TYPE_BUY))
+         {
+            trade.Buy(Lot);
+            g_total_orders++;
+            Print("EMA: DCA BUY @ ", ask);
+         }
+      }
+   }
+
+   // ===== XU LY SELL DOC LAP =====
+   if(emaFast < emaSlow)
+   {
+      if(!g_sell_opened)
+      {
+         trade.Sell(Lot);
+         g_sell_opened = true;
+         g_total_orders++;
+         Print("EMA: Mo SELL dau tien @ ", bid);
+      }
+      else if(sells > 0 && sells < MaxOrders)
+      {
+         double highest_sell = 0;
+         for(int i = 0; i < PositionsTotal(); i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_SELL) continue;
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(op > highest_sell) highest_sell = op;
+         }
+         if(ask > highest_sell + DCA_Distance && IsPriceZoneClear(bid, POSITION_TYPE_SELL))
+         {
+            trade.Sell(Lot);
+            g_total_orders++;
+            Print("EMA: DCA SELL @ ", bid);
+         }
+      }
+   }
+
+   RefreshUI();
+}
+
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam,
+                  const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   if(sparam == BTN_BUY)
+   {
+      ObjectSetInteger(0, BTN_BUY, OBJPROP_STATE, false);
+      trade.Buy(Lot);
+      g_buy_opened = true;
+      g_total_orders++;
+   }
+   else if(sparam == BTN_SELL)
+   {
+      ObjectSetInteger(0, BTN_SELL, OBJPROP_STATE, false);
+      trade.Sell(Lot);
+      g_sell_opened = true;
+      g_total_orders++;
+   }
+   else if(sparam == BTN_CLOSE_BUY)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_BUY, OBJPROP_STATE, false);
+      CloseByType(POSITION_TYPE_BUY);
+      g_buy_opened = false;
+   }
+   else if(sparam == BTN_CLOSE_SELL)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_SELL, OBJPROP_STATE, false);
+      CloseByType(POSITION_TYPE_SELL);
+      g_sell_opened = false;
+   }
+   else if(sparam == BTN_CLOSE_ALL)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_ALL, OBJPROP_STATE, false);
+      CloseAll();
+      g_total_orders = 0;
+      g_buy_opened   = false;
+      g_sell_opened  = false;
+   }
+
+   RefreshUI();
+}
+
+//+------------------------------------------------------------------+
+double GetEMA(int period)
+{
+   int handle = iMA(_Symbol, PERIOD_CURRENT, period, 0, MODE_EMA, PRICE_CLOSE);
+   if(handle == INVALID_HANDLE) return 0;
+   double buf[1];
+   if(CopyBuffer(handle, 0, 0, 1, buf) <= 0) return 0;
+   return buf[0];
+}
+
+int CountOrders()
+{
+   int total = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      total++;
+   }
+   return total;
+}
+
+int CountByType(long pos_type)
+{
+   int total = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+      total++;
+   }
+   return total;
+}
+
+double TotalProfit()
+{
+   double profit = 0;
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      profit += PositionGetDouble(POSITION_PROFIT);
+      profit += PositionGetDouble(POSITION_SWAP);
+   }
+   return profit;
+}
+
+void CloseAll()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      trade.PositionClose(ticket);
+   }
+}
+
+void CloseByType(long pos_type)
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE)  != pos_type) continue;
+      trade.PositionClose(ticket);
+   }
+}
+
+void CreateButtons()
+{
+   ENUM_BASE_CORNER corner = ButtonCornerTop ? CORNER_LEFT_UPPER : CORNER_LEFT_LOWER;
+   int x = ButtonOffsetX;
+   int y = ButtonOffsetY;
+   int h = ButtonHeight + ButtonGap;
+   MakeButton(BTN_BUY,        "BUY",        x, y, clrGreen,     corner); y += h;
+   MakeButton(BTN_CLOSE_BUY,  "Close BUY",  x, y, clrDimGray,   corner); y += h;
+   MakeButton(BTN_SELL,       "SELL",        x, y, clrFireBrick, corner); y += h;
+   MakeButton(BTN_CLOSE_SELL, "Close SELL", x, y, clrDimGray,   corner); y += h;
+   MakeButton(BTN_CLOSE_ALL,  "Close ALL",  x, y, clrDimGray,   corner);
+}
+
+void MakeButton(const string name, const string text,
+                const int xd, const int yd, const color bg,
+                const ENUM_BASE_CORNER corner)
+{
+   if(ObjectFind(0, name) >= 0) { ObjectSetString(0, name, OBJPROP_TEXT, text); return; }
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0)) return;
+   ObjectSetInteger(0, name, OBJPROP_CORNER,       corner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,    xd);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,    yd);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,        ButtonWidth);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,        ButtonHeight);
+   ObjectSetString(0,  name, OBJPROP_TEXT,         text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,        clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,      bg);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrSilver);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
+}
+
+void CreateStatsLabel()
+{
+   if(ObjectFind(0, LBL_STATS) >= 0) return;
+   ENUM_BASE_CORNER corner = ButtonCornerTop ? CORNER_LEFT_UPPER : CORNER_LEFT_LOWER;
+   int x = ButtonOffsetX;
+   int y = ButtonOffsetY + (ButtonHeight + ButtonGap) * 5 + 6;
+   ObjectCreate(0, LBL_STATS, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_CORNER,     corner);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_YDISTANCE,  y);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_COLOR,      clrYellow);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_FONTSIZE,   9);
+   ObjectSetString(0,  LBL_STATS, OBJPROP_FONT,       "Arial Bold");
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_SELECTABLE, false);
+   ObjectSetString(0,  LBL_STATS, OBJPROP_TEXT,       "Lenh: 0 | P&L: $0.00");
+}
+
+void RefreshUI()
+{
+   int    buy_count  = CountByType(POSITION_TYPE_BUY);
+   int    sell_count = CountByType(POSITION_TYPE_SELL);
+   int    orders     = CountOrders();
+   double pnl        = TotalProfit();
+   double buy_target  = buy_count  * TP_PerOrder;
+   double sell_target = sell_count * TP_PerOrder;
+
+   color buy_bg = (buy_count > 0) ? clrDarkGreen : clrGreen;
+   if(ObjectFind(0, BTN_BUY) >= 0)
+   {
+      ObjectSetInteger(0, BTN_BUY, OBJPROP_BGCOLOR, buy_bg);
+      string lbl = (buy_count > 0) ? ("BUY " + IntegerToString(buy_count)) : "BUY";
+      ObjectSetString(0, BTN_BUY, OBJPROP_TEXT, lbl);
+   }
+
+   color sell_bg = (sell_count > 0) ? clrMaroon : clrFireBrick;
+   if(ObjectFind(0, BTN_SELL) >= 0)
+   {
+      ObjectSetInteger(0, BTN_SELL, OBJPROP_BGCOLOR, sell_bg);
+      string lbl = (sell_count > 0) ? ("SELL " + IntegerToString(sell_count)) : "SELL";
+      ObjectSetString(0, BTN_SELL, OBJPROP_TEXT, lbl);
+   }
+
+   if(ObjectFind(0, LBL_STATS) < 0) CreateStatsLabel();
+   string pnl_str = (pnl >= 0 ? "+" : "") + DoubleToString(pnl, 2);
+   string target_str = "";
+   if(buy_count > 0 || sell_count > 0)
+      target_str = " | B:$" + DoubleToString(buy_target, 0)
+                 + " S:$" + DoubleToString(sell_target, 0);
+   string txt = "Lenh: " + IntegerToString(g_total_orders)
+              + " | P&L: $" + pnl_str + target_str;
+   ObjectSetString(0, LBL_STATS, OBJPROP_TEXT, txt);
+   color c = (pnl > 0) ? clrLime : (pnl < 0 ? clrRed : clrYellow);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_COLOR, c);
+}
