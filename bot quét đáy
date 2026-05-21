@@ -1,6 +1,6 @@
-# gold_london_bot.py
-# Bot XAUUSD London Breakout - không DCA, không gồng
-# Mặc định đang để DEMO_MODE = True, chưa vào lệnh thật
+# gold_sweep_bot.py
+# XAUUSD Liquidity Sweep + Reversal
+# DEMO_MODE=True: chỉ báo tín hiệu, chưa vào lệnh thật
 
 import MetaTrader5 as mt5
 import pandas as pd
@@ -8,36 +8,28 @@ import time
 from datetime import datetime, time as dtime
 from zoneinfo import ZoneInfo
 
-# ======================
-# CONFIG
-# ======================
-
 SYMBOL = "XAUUSD"
 LOT = 0.01
-
-DEMO_MODE = True  # True = chỉ báo tín hiệu, False = vào lệnh thật
-
-ASIA_START = dtime(6, 0)      # 6h VN
-ASIA_END = dtime(13, 0)       # 13h VN
-
-TRADE_START = dtime(14, 0)    # London mở, 14h VN
-TRADE_END = dtime(18, 0)      # hết khung canh lệnh
-
-MIN_RANGE = 5.0       # range Á tối thiểu 5 giá
-MAX_RANGE = 18.0      # range Á tối đa 18 giá
-
-MAX_SPREAD = 0.5      # spread tối đa
-SL_USD = 8.0          # SL 8 giá
-TP_USD = 16.0         # TP 16 giá, RR 1:2
-
-MAGIC = 888001
+DEMO_MODE = True
 
 VN_TZ = ZoneInfo("Asia/Ho_Chi_Minh")
 
+TRADE_START = dtime(14, 0)
+TRADE_END = dtime(23, 0)
 
-# ======================
-# INIT
-# ======================
+MAGIC = 888002
+
+MAX_SPREAD = 0.6
+
+SWING_LOOKBACK = 20
+SWEEP_BUFFER = 0.5       # quét qua đỉnh/đáy ít nhất 0.5 giá
+BOS_BUFFER = 0.3         # phá cấu trúc ít nhất 0.3 giá
+
+SL_BUFFER = 1.0
+RR = 2.0                 # TP = 2R
+
+MAX_TRADES_PER_DAY = 2
+
 
 def connect_mt5():
     if not mt5.initialize():
@@ -52,11 +44,10 @@ def connect_mt5():
     if not info.visible:
         mt5.symbol_select(SYMBOL, True)
 
-    print("Đã kết nối MT5")
-    print("Symbol:", SYMBOL)
+    print("Đã kết nối MT5:", SYMBOL)
 
 
-def get_rates(timeframe, count=300):
+def get_rates(timeframe, count=200):
     rates = mt5.copy_rates_from_pos(SYMBOL, timeframe, 0, count)
     if rates is None:
         return None
@@ -66,76 +57,10 @@ def get_rates(timeframe, count=300):
     return df
 
 
-def ema(series, period):
-    return series.ewm(span=period, adjust=False).mean()
-
-
-def rsi(series, period=14):
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0).rolling(period).mean()
-    loss = -delta.where(delta < 0, 0).rolling(period).mean()
-    rs = gain / loss
-    return 100 - (100 / (1 + rs))
-
-
-# ======================
-# RANGE PHIÊN Á
-# ======================
-
-def get_asia_range():
-    df = get_rates(mt5.TIMEFRAME_M5, 300)
-    if df is None or df.empty:
-        return None, None, None
-
-    today = datetime.now(VN_TZ).date()
-
-    df["vn_time"] = df["time"].dt.tz_localize("UTC").dt.tz_convert(VN_TZ)
-
-    asia_df = df[
-        (df["vn_time"].dt.date == today) &
-        (df["vn_time"].dt.time >= ASIA_START) &
-        (df["vn_time"].dt.time <= ASIA_END)
-    ]
-
-    if asia_df.empty:
-        return None, None, None
-
-    high = asia_df["high"].max()
-    low = asia_df["low"].min()
-    range_size = high - low
-
-    return high, low, range_size
-
-
-# ======================
-# FILTER
-# ======================
-
-def check_filter(direction):
-    df = get_rates(mt5.TIMEFRAME_M15, 100)
-    if df is None or len(df) < 60:
-        return False
-
-    df["ema20"] = ema(df["close"], 20)
-    df["ema50"] = ema(df["close"], 50)
-    df["rsi"] = rsi(df["close"], 14)
-
-    last = df.iloc[-1]
-
-    if direction == "BUY":
-        return last["ema20"] > last["ema50"] and last["rsi"] > 55
-
-    if direction == "SELL":
-        return last["ema20"] < last["ema50"] and last["rsi"] < 45
-
-    return False
-
-
 def get_spread():
     tick = mt5.symbol_info_tick(SYMBOL)
     if tick is None:
         return 999
-
     return tick.ask - tick.bid
 
 
@@ -144,44 +69,182 @@ def has_open_position():
     if positions is None:
         return False
 
-    for pos in positions:
-        if pos.magic == MAGIC:
+    for p in positions:
+        if p.magic == MAGIC:
             return True
 
     return False
 
 
-# ======================
-# ORDER
-# ======================
+def ema(series, period):
+    return series.ewm(span=period, adjust=False).mean()
 
-def send_order(direction):
+
+def trend_filter(direction):
+    df = get_rates(mt5.TIMEFRAME_M15, 100)
+    if df is None or len(df) < 60:
+        return False
+
+    df["ema50"] = ema(df["close"], 50)
+    df["ema200"] = ema(df["close"], 200) if len(df) >= 200 else ema(df["close"], 80)
+
+    last = df.iloc[-1]
+
+    # Với sweep reversal, không cần thuận trend quá mạnh.
+    # Chỉ tránh đánh ngược khi trend quá căng.
+    if direction == "SELL":
+        return True
+
+    if direction == "BUY":
+        return True
+
+    return False
+
+
+def find_recent_swing_high(df):
+    recent = df.iloc[-SWING_LOOKBACK-3:-3]
+    return recent["high"].max()
+
+
+def find_recent_swing_low(df):
+    recent = df.iloc[-SWING_LOOKBACK-3:-3]
+    return recent["low"].min()
+
+
+def detect_sweep_signal():
+    df = get_rates(mt5.TIMEFRAME_M5, 120)
+
+    if df is None or len(df) < 50:
+        return None
+
+    # lấy nến đã đóng gần nhất
+    last = df.iloc[-2]
+    prev = df.iloc[-3]
+
+    swing_high = find_recent_swing_high(df)
+    swing_low = find_recent_swing_low(df)
+
+    # =========================
+    # SELL SETUP
+    # Sweep đỉnh:
+    # - high chọt lên trên swing high
+    # - nhưng close đóng lại dưới swing high
+    # =========================
+
+    swept_high = (
+        last["high"] > swing_high + SWEEP_BUFFER and
+        last["close"] < swing_high
+    )
+
+    if swept_high:
+        print("Phát hiện sweep đỉnh.")
+        return {
+            "direction": "WAIT_SELL_BOS",
+            "sweep_high": last["high"],
+            "sweep_low": last["low"],
+            "bos_level": prev["low"],
+            "swing_high": swing_high,
+            "swing_low": swing_low
+        }
+
+    # =========================
+    # BUY SETUP
+    # Sweep đáy:
+    # - low chọt xuống dưới swing low
+    # - nhưng close đóng lại trên swing low
+    # =========================
+
+    swept_low = (
+        last["low"] < swing_low - SWEEP_BUFFER and
+        last["close"] > swing_low
+    )
+
+    if swept_low:
+        print("Phát hiện sweep đáy.")
+        return {
+            "direction": "WAIT_BUY_BOS",
+            "sweep_high": last["high"],
+            "sweep_low": last["low"],
+            "bos_level": prev["high"],
+            "swing_high": swing_high,
+            "swing_low": swing_low
+        }
+
+    return None
+
+
+def wait_for_bos(signal, max_wait_candles=6):
+    direction = signal["direction"]
+    bos_level = signal["bos_level"]
+
+    print("Đang chờ BOS...")
+    print("BOS level:", bos_level)
+
+    checked = 0
+
+    while checked < max_wait_candles:
+        df = get_rates(mt5.TIMEFRAME_M5, 30)
+
+        if df is None or len(df) < 10:
+            time.sleep(30)
+            continue
+
+        last = df.iloc[-2]
+        close_price = last["close"]
+
+        if direction == "WAIT_SELL_BOS":
+            if close_price < bos_level - BOS_BUFFER:
+                print("Có BOS giảm.")
+                return "SELL"
+
+        if direction == "WAIT_BUY_BOS":
+            if close_price > bos_level + BOS_BUFFER:
+                print("Có BOS tăng.")
+                return "BUY"
+
+        checked += 1
+        print("Chưa BOS, chờ nến tiếp...")
+        time.sleep(60)
+
+    print("Quá thời gian chờ BOS. Bỏ setup.")
+    return None
+
+
+def send_order(direction, signal):
     tick = mt5.symbol_info_tick(SYMBOL)
     if tick is None:
         print("Không lấy được giá.")
         return
 
-    if direction == "BUY":
-        price = tick.ask
-        sl = price - SL_USD
-        tp = price + TP_USD
-        order_type = mt5.ORDER_TYPE_BUY
+    if direction == "SELL":
+        price = tick.bid
+        sl = signal["sweep_high"] + SL_BUFFER
+        risk = sl - price
+        tp = price - risk * RR
+        order_type = mt5.ORDER_TYPE_SELL
 
     else:
-        price = tick.bid
-        sl = price + SL_USD
-        tp = price - TP_USD
-        order_type = mt5.ORDER_TYPE_SELL
+        price = tick.ask
+        sl = signal["sweep_low"] - SL_BUFFER
+        risk = price - sl
+        tp = price + risk * RR
+        order_type = mt5.ORDER_TYPE_BUY
+
+    if risk <= 0:
+        print("Risk lỗi, bỏ lệnh.")
+        return
 
     print("==============================")
     print("TÍN HIỆU:", direction)
-    print("Giá vào:", price)
+    print("Entry:", price)
     print("SL:", sl)
     print("TP:", tp)
+    print("Risk:", round(risk, 2))
+    print("RR:", RR)
     print("==============================")
 
     if DEMO_MODE:
-        print("DEMO_MODE đang bật, bot chưa vào lệnh thật.")
+        print("DEMO_MODE đang bật, chưa vào lệnh thật.")
         return
 
     request = {
@@ -194,7 +257,7 @@ def send_order(direction):
         "tp": tp,
         "deviation": 30,
         "magic": MAGIC,
-        "comment": "London Breakout Bot",
+        "comment": "Liquidity Sweep Bot",
         "type_time": mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
@@ -203,14 +266,10 @@ def send_order(direction):
     print("Kết quả vào lệnh:", result)
 
 
-# ======================
-# MAIN BOT
-# ======================
-
 def run_bot():
     connect_mt5()
 
-    traded_today = False
+    trade_count = 0
     current_day = datetime.now(VN_TZ).date()
 
     while True:
@@ -218,23 +277,18 @@ def run_bot():
         now_time = now.time()
 
         if now.date() != current_day:
-            traded_today = False
+            trade_count = 0
             current_day = now.date()
 
         print("Giờ VN:", now.strftime("%H:%M:%S"))
 
-        if now_time < TRADE_START:
-            print("Chưa tới giờ London. Bot đang chờ...")
+        if now_time < TRADE_START or now_time > TRADE_END:
+            print("Ngoài giờ trade.")
             time.sleep(60)
             continue
 
-        if now_time > TRADE_END:
-            print("Hết giờ trade hôm nay.")
-            time.sleep(300)
-            continue
-
-        if traded_today:
-            print("Hôm nay đã có tín hiệu rồi. Không vào thêm.")
+        if trade_count >= MAX_TRADES_PER_DAY:
+            print("Đủ số lệnh hôm nay. Nghỉ.")
             time.sleep(120)
             continue
 
@@ -243,62 +297,34 @@ def run_bot():
             time.sleep(60)
             continue
 
-        asia_high, asia_low, range_size = get_asia_range()
-
-        if asia_high is None:
-            print("Chưa có đủ dữ liệu range Á.")
-            time.sleep(60)
-            continue
-
-        print("Asia High:", asia_high)
-        print("Asia Low:", asia_low)
-        print("Asia Range:", round(range_size, 2))
-
-        if range_size < MIN_RANGE:
-            print("Range quá nhỏ, dễ fake breakout. Bỏ qua.")
-            time.sleep(60)
-            continue
-
-        if range_size > MAX_RANGE:
-            print("Range quá lớn, thị trường đã chạy trước. Bỏ qua.")
-            time.sleep(60)
-            continue
-
         spread = get_spread()
         print("Spread:", round(spread, 3))
 
         if spread > MAX_SPREAD:
-            print("Spread cao quá. Không vào.")
+            print("Spread cao, bỏ qua.")
             time.sleep(30)
             continue
 
-        df_m5 = get_rates(mt5.TIMEFRAME_M5, 50)
-        last = df_m5.iloc[-2]  # lấy nến M5 đã đóng
+        signal = detect_sweep_signal()
 
-        close_price = last["close"]
+        if signal is None:
+            print("Chưa có sweep.")
+            time.sleep(30)
+            continue
 
-        if close_price > asia_high:
-            print("Phát hiện breakout BUY")
+        direction = wait_for_bos(signal)
 
-            if check_filter("BUY"):
-                send_order("BUY")
-                traded_today = True
-            else:
-                print("BUY bị loại vì EMA/RSI chưa đạt.")
+        if direction is None:
+            continue
 
-        elif close_price < asia_low:
-            print("Phát hiện breakout SELL")
+        if not trend_filter(direction):
+            print("Không đạt trend filter.")
+            continue
 
-            if check_filter("SELL"):
-                send_order("SELL")
-                traded_today = True
-            else:
-                print("SELL bị loại vì EMA/RSI chưa đạt.")
+        send_order(direction, signal)
+        trade_count += 1
 
-        else:
-            print("Chưa breakout.")
-
-        time.sleep(30)
+        time.sleep(120)
 
 
 if __name__ == "__main__":
