@@ -1,6 +1,6 @@
 //+------------------------------------------------------------------+
-//|                 Gold London Breakout EA                         |
-//|                     XAUUSD - No DCA                             |
+//|              Gold London Breakout EA v2                          |
+//|                  XAUUSD - No DCA                                 |
 //+------------------------------------------------------------------+
 #property strict
 
@@ -8,9 +8,11 @@
 
 CTrade trade;
 
-// ======================
+//=========================
 // INPUT
-// ======================
+//=========================
+
+input int MagicNumber = 888001;
 
 input double LotSize = 0.01;
 
@@ -33,7 +35,7 @@ input int RSIPeriod = 14;
 
 input bool OneTradePerDay = true;
 
-// ======================
+//=========================
 
 double AsiaHigh = 0;
 double AsiaLow = 0;
@@ -42,23 +44,24 @@ bool TradedToday = false;
 int LastDay = -1;
 
 //+------------------------------------------------------------------+
-//| Expert initialization                                            |
+//| INIT                                                             |
 //+------------------------------------------------------------------+
 int OnInit()
 {
-   Print("Gold London Breakout EA Started");
+   trade.SetExpertMagicNumber(MagicNumber);
+
+   Print("Gold London Breakout EA v2 Started");
+
    return(INIT_SUCCEEDED);
 }
 
 //+------------------------------------------------------------------+
-//| Expert tick                                                      |
+//| MAIN                                                             |
 //+------------------------------------------------------------------+
 void OnTick()
 {
-   datetime now = TimeCurrent();
-
    MqlDateTime tm;
-   TimeToStruct(now, tm);
+   TimeToStruct(TimeCurrent(), tm);
 
    int hour = tm.hour;
    int today = tm.day;
@@ -70,15 +73,16 @@ void OnTick()
       LastDay = today;
    }
 
-   // Chỉ trade trong giờ
+   // Chỉ trade trong giờ London
    if(hour < TradeStartHour || hour > TradeEndHour)
       return;
 
+   // Chỉ 1 lệnh/ngày
    if(OneTradePerDay && TradedToday)
       return;
 
-   // Không vào thêm nếu đang có lệnh
-   if(PositionsTotal() > 0)
+   // Chỉ check lệnh của chính bot này
+   if(HasMyPosition())
       return;
 
    // Lấy range phiên Á
@@ -86,8 +90,16 @@ void OnTick()
 
    double range = AsiaHigh - AsiaLow;
 
+   Print("Asia High: ", AsiaHigh);
+   Print("Asia Low: ", AsiaLow);
+   Print("Range: ", range);
+
+   // Filter range
    if(range < MinRange || range > MaxRange)
+   {
+      Print("Range không hợp lệ.");
       return;
+   }
 
    // Giá hiện tại
    double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
@@ -100,56 +112,117 @@ void OnTick()
    // RSI
    double rsi = GetRSI(RSIPeriod);
 
-   // ======================
-   // BUY BREAKOUT
-   // ======================
-
+   // Nến M5 đã đóng
    double lastClose = iClose(_Symbol, PERIOD_M5, 1);
+
+   //=========================
+   // BUY BREAKOUT
+   //=========================
 
    if(lastClose > AsiaHigh)
    {
+      Print("Phát hiện BUY breakout");
+
       if(emaFast > emaSlow && rsi > 55)
       {
          double sl = ask - StopLossUSD;
          double tp = ask + TakeProfitUSD;
 
-         trade.Buy(LotSize, _Symbol, ask, sl, tp, "London Breakout BUY");
+         bool result = trade.Buy(
+            LotSize,
+            _Symbol,
+            ask,
+            sl,
+            tp,
+            "London Breakout BUY"
+         );
 
-         Print("BUY OPENED");
-
-         TradedToday = true;
+         if(result)
+         {
+            Print("BUY OPENED");
+            TradedToday = true;
+         }
+         else
+         {
+            Print("BUY FAILED");
+         }
+      }
+      else
+      {
+         Print("BUY bị filter EMA/RSI");
       }
    }
 
-   // ======================
+   //=========================
    // SELL BREAKOUT
-   // ======================
+   //=========================
 
    if(lastClose < AsiaLow)
    {
+      Print("Phát hiện SELL breakout");
+
       if(emaFast < emaSlow && rsi < 45)
       {
          double sl = bid + StopLossUSD;
          double tp = bid - TakeProfitUSD;
 
-         trade.Sell(LotSize, _Symbol, bid, sl, tp, "London Breakout SELL");
+         bool result = trade.Sell(
+            LotSize,
+            _Symbol,
+            bid,
+            sl,
+            tp,
+            "London Breakout SELL"
+         );
 
-         Print("SELL OPENED");
-
-         TradedToday = true;
+         if(result)
+         {
+            Print("SELL OPENED");
+            TradedToday = true;
+         }
+         else
+         {
+            Print("SELL FAILED");
+         }
+      }
+      else
+      {
+         Print("SELL bị filter EMA/RSI");
       }
    }
 }
 
 //+------------------------------------------------------------------+
-//| Get Asia Range                                                   |
+//| CHECK POSITION                                                   |
+//+------------------------------------------------------------------+
+bool HasMyPosition()
+{
+   for(int i = PositionsTotal() - 1; i >= 0; i--)
+   {
+      ulong ticket = PositionGetTicket(i);
+
+      if(PositionSelectByTicket(ticket))
+      {
+         long magic = PositionGetInteger(POSITION_MAGIC);
+         string symbol = PositionGetString(POSITION_SYMBOL);
+
+         if(magic == MagicNumber && symbol == _Symbol)
+         {
+            return true;
+         }
+      }
+   }
+
+   return false;
+}
+
+//+------------------------------------------------------------------+
+//| GET ASIA RANGE                                                   |
 //+------------------------------------------------------------------+
 void GetAsiaRange()
 {
    AsiaHigh = -999999;
    AsiaLow = 999999;
-
-   datetime now = TimeCurrent();
 
    for(int i = 0; i < 200; i++)
    {
@@ -177,7 +250,14 @@ void GetAsiaRange()
 //+------------------------------------------------------------------+
 double GetEMA(int period)
 {
-   int handle = iMA(_Symbol, PERIOD_M15, period, 0, MODE_EMA, PRICE_CLOSE);
+   int handle = iMA(
+      _Symbol,
+      PERIOD_M15,
+      period,
+      0,
+      MODE_EMA,
+      PRICE_CLOSE
+   );
 
    double buffer[];
 
@@ -191,7 +271,12 @@ double GetEMA(int period)
 //+------------------------------------------------------------------+
 double GetRSI(int period)
 {
-   int handle = iRSI(_Symbol, PERIOD_M15, period, PRICE_CLOSE);
+   int handle = iRSI(
+      _Symbol,
+      PERIOD_M15,
+      period,
+      PRICE_CLOSE
+   );
 
    double buffer[];
 
