@@ -1,0 +1,752 @@
+//+------------------------------------------------------------------+
+//| EMAGrid.mq5                                                      |
+//| EMA 50/200 Cross Grid Bot                                        |
+//| TP/SL theo gia | BE | Max 10 lenh | Style v1.10                  |
+//+------------------------------------------------------------------+
+#property copyright "EMAGrid"
+#property version   "1.00"
+
+#include <Trade/Trade.mqh>
+
+enum ENUM_TRADING_DIRECTION
+{
+   DIRECTION_BOTH      = 0,
+   DIRECTION_BUY_ONLY  = 1,
+   DIRECTION_SELL_ONLY = 2
+};
+
+input group "=== EMA SETTINGS ==="
+input int    EMA_Fast_Period   = 50;
+input int    EMA_Slow_Period   = 200;
+
+input group "=== TRADING CONFIGURATION ==="
+input ENUM_TRADING_DIRECTION TradingDirection = DIRECTION_BOTH;
+input double LotSize           = 0.02;
+input int    Max_Grid_Levels   = 10;
+input int    DCA_IntervalMin   = 2;
+input double DCA_PriceDistance = 2.0;  // Khoang cach gia toi thieu giua 2 lenh DCA
+
+input group "=== TP / SL / BREAKEVEN ==="
+input double SL_Price          = 5.0;    // Cat lo (tinh theo gia, vd 5 = 5 don vi gia)
+input double TP_Price          = 5.0;    // Chot loi (tinh theo gia)
+input double BE_TriggerPrice   = 7;    // Doi SL khi loi du (tinh theo gia)
+input double BE_LockDollar     = 0.20;   // Khoa lai toi thieu khi doi SL ($)
+
+input group "=== SYSTEM ==="
+input int    BuyMagicNumber    = 666666;
+input int    SellMagicNumber   = 888888;
+input int    DeviationPoints   = 30;
+
+input group "=== CHART BUTTONS ==="
+input bool   ButtonCornerTop   = true;
+input int    ButtonOffsetX     = 12;
+input int    ButtonOffsetY     = 28;
+input int    ButtonWidth       = 118;
+input int    ButtonHeight      = 24;
+input int    ButtonGap         = 4;
+
+struct GridLevel
+{
+   ulong    ticket;
+   double   open_price;
+   bool     be_moved;
+   bool     is_open;
+};
+
+GridLevel  buy_grid[];
+GridLevel  sell_grid[];
+int        active_buy_levels  = 0;
+int        active_sell_levels = 0;
+bool       buy_grid_active    = false;
+bool       sell_grid_active   = false;
+
+datetime   g_last_buy_open    = 0;
+datetime   g_last_sell_open   = 0;
+double     g_last_buy_price   = 0;
+double     g_last_sell_price  = 0;
+
+// Stats tu khi bat bot / reset
+int        g_total_orders     = 0;
+double     g_total_profit     = 0;  // Tong loi (lenh da dong)
+double     g_total_loss       = 0;  // Tong lo (lenh da dong)
+
+// EMA handles
+int        g_ema_fast_handle  = INVALID_HANDLE;
+int        g_ema_slow_handle  = INVALID_HANDLE;
+
+// Trang thai EMA cross truoc do
+int        g_prev_cross       = 0;  // 1 = fast > slow, -1 = fast < slow, 0 = chua xac dinh
+
+CTrade     trade;
+int        g_pip_points       = 10;
+
+const string BTN_START_BUY  = "EMAGrid_StartBuy";
+const string BTN_START_SELL = "EMAGrid_StartSell";
+const string BTN_CLOSE_BUY  = "EMAGrid_CloseBuy";
+const string BTN_CLOSE_SELL = "EMAGrid_CloseSell";
+const string BTN_CLOSE_ALL  = "EMAGrid_CloseAll";
+const string BTN_RESET      = "EMAGrid_Reset";
+const string LBL_STATS      = "EMAGrid_Stats";
+
+//+------------------------------------------------------------------+
+int OnInit()
+{
+   int digits   = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   g_pip_points = (digits == 2 || digits == 4) ? 10 : 100;
+
+   ArrayResize(buy_grid,  Max_Grid_Levels);
+   ArrayResize(sell_grid, Max_Grid_Levels);
+   ResetGrid(buy_grid);
+   ResetGrid(sell_grid);
+
+   trade.SetDeviationInPoints(DeviationPoints);
+   trade.SetTypeFillingBySymbol(_Symbol);
+
+   // Khoi tao EMA handles
+   g_ema_fast_handle = iMA(_Symbol, PERIOD_CURRENT, EMA_Fast_Period, 0, MODE_EMA, PRICE_CLOSE);
+   g_ema_slow_handle = iMA(_Symbol, PERIOD_CURRENT, EMA_Slow_Period, 0, MODE_EMA, PRICE_CLOSE);
+
+   if(g_ema_fast_handle == INVALID_HANDLE || g_ema_slow_handle == INVALID_HANDLE)
+   {
+      Print("EMAGrid: Khoi tao EMA that bai!");
+      return INIT_FAILED;
+   }
+
+   g_total_orders = 0;
+   g_total_profit = 0;
+   g_total_loss   = 0;
+   g_prev_cross   = 0;
+
+   CreateOrUpdateButtons();
+   CreateStatsLabel();
+
+   // Check trang thai EMA ngay khi bat bot
+   // Doi indicator load du lieu truoc
+   double fast_buf[3], slow_buf[3];
+   int retry = 0;
+   while(retry < 50)
+   {
+      if(CopyBuffer(g_ema_fast_handle, 0, 0, 3, fast_buf) >= 3 &&
+         CopyBuffer(g_ema_slow_handle, 0, 0, 3, slow_buf) >= 3)
+         break;
+      Sleep(100);
+      retry++;
+   }
+
+   if(retry < 50)
+   {
+      double fast_cur = fast_buf[0];
+      double slow_cur = slow_buf[0];
+      g_prev_cross = (fast_cur > slow_cur) ? 1 : -1;
+
+      if(fast_cur > slow_cur)
+      {
+         Print("EMAGrid: Bat bot - EMA50 > EMA200 -> Start BUY");
+         if(TradingDirection != DIRECTION_SELL_ONLY)
+            RequestStartBuyGrid();
+      }
+      else
+      {
+         Print("EMAGrid: Bat bot - EMA50 < EMA200 -> Start SELL");
+         if(TradingDirection != DIRECTION_BUY_ONLY)
+            RequestStartSellGrid();
+      }
+   }
+   else
+      Print("EMAGrid: Canh bao - khong doc duoc EMA khi init, se check lai o OnTick dau tien");
+
+   return INIT_SUCCEEDED;
+}
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+{
+   if(g_ema_fast_handle != INVALID_HANDLE) IndicatorRelease(g_ema_fast_handle);
+   if(g_ema_slow_handle != INVALID_HANDLE) IndicatorRelease(g_ema_slow_handle);
+
+   ObjectDelete(0, BTN_START_BUY);
+   ObjectDelete(0, BTN_START_SELL);
+   ObjectDelete(0, BTN_CLOSE_BUY);
+   ObjectDelete(0, BTN_CLOSE_SELL);
+   ObjectDelete(0, BTN_CLOSE_ALL);
+   ObjectDelete(0, BTN_RESET);
+   ObjectDelete(0, LBL_STATS);
+}
+
+//+------------------------------------------------------------------+
+void OnTick()
+{
+   CheckEMACross();
+
+   if(buy_grid_active)
+   {
+      SyncGridState(buy_grid,  BuyMagicNumber,  POSITION_TYPE_BUY,  active_buy_levels);
+      ManageBreakeven(buy_grid,  POSITION_TYPE_BUY);
+      ManageTpSl(buy_grid,  POSITION_TYPE_BUY);
+      DCA_TimerOpen(buy_grid,  BuyMagicNumber,  1,  active_buy_levels,
+                    g_last_buy_open,  g_last_buy_price);
+   }
+   if(sell_grid_active)
+   {
+      SyncGridState(sell_grid, SellMagicNumber, POSITION_TYPE_SELL, active_sell_levels);
+      ManageBreakeven(sell_grid, POSITION_TYPE_SELL);
+      ManageTpSl(sell_grid, POSITION_TYPE_SELL);
+      DCA_TimerOpen(sell_grid, SellMagicNumber, -1, active_sell_levels,
+                    g_last_sell_open, g_last_sell_price);
+   }
+
+   UpdateButtonAppearance();
+   UpdateStatsLabel();
+}
+
+//+------------------------------------------------------------------+
+// Doc gia tri EMA
+//+------------------------------------------------------------------+
+bool GetEMAValues(double &fast_cur, double &slow_cur, double &fast_prev, double &slow_prev)
+{
+   double fast_buf[3], slow_buf[3];
+   if(CopyBuffer(g_ema_fast_handle, 0, 0, 3, fast_buf) < 3) return false;
+   if(CopyBuffer(g_ema_slow_handle, 0, 0, 3, slow_buf) < 3) return false;
+
+   // buf[0] = hien tai, buf[1] = nen truoc, buf[2] = 2 nen truoc
+   fast_cur  = fast_buf[0];
+   slow_cur  = slow_buf[0];
+   fast_prev = fast_buf[1];
+   slow_prev = slow_buf[1];
+   return true;
+}
+
+//+------------------------------------------------------------------+
+// Kiem tra EMA cross va mo lenh
+//+------------------------------------------------------------------+
+void CheckEMACross()
+{
+   double fast_cur, slow_cur, fast_prev, slow_prev;
+   if(!GetEMAValues(fast_cur, slow_cur, fast_prev, slow_prev)) return;
+
+   int cur_state  = (fast_cur  > slow_cur)  ?  1 : -1;
+   int prev_state = (fast_prev > slow_prev) ?  1 : -1;
+
+   // Cross xay ra khi state thay doi
+   if(cur_state != prev_state)
+   {
+      if(cur_state == 1 && g_prev_cross != 1)
+      {
+         // EMA fast cat len slow -> BUY signal
+         if(TradingDirection != DIRECTION_SELL_ONLY)
+         {
+            if(!buy_grid_active)
+               RequestStartBuyGrid();
+            else
+               TriggerDCABuy();
+         }
+         g_prev_cross = 1;
+         Print("EMAGrid: EMA cross UP - BUY signal");
+      }
+      else if(cur_state == -1 && g_prev_cross != -1)
+      {
+         // EMA fast cat xuong slow -> SELL signal
+         if(TradingDirection != DIRECTION_BUY_ONLY)
+         {
+            if(!sell_grid_active)
+               RequestStartSellGrid();
+            else
+               TriggerDCASell();
+         }
+         g_prev_cross = -1;
+         Print("EMAGrid: EMA cross DOWN - SELL signal");
+      }
+   }
+
+   if(g_prev_cross == 0)
+      g_prev_cross = cur_state;
+}
+
+//+------------------------------------------------------------------+
+void TriggerDCABuy()
+{
+   // Reset timer de mo lenh moi ngay khi co cross moi
+   g_last_buy_open = 0;
+}
+
+//+------------------------------------------------------------------+
+void TriggerDCASell()
+{
+   g_last_sell_open = 0;
+}
+
+//+------------------------------------------------------------------+
+double NormalizeLot(double lot)
+{
+   double min_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double max_lot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+   double lot_step = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   if(lot < min_lot) lot = min_lot;
+   if(lot > max_lot) lot = max_lot;
+   return NormalizeDouble(MathRound(lot / lot_step) * lot_step, 2);
+}
+
+//+------------------------------------------------------------------+
+void ResetGrid(GridLevel &grid[])
+{
+   for(int i = 0; i < Max_Grid_Levels; i++)
+   {
+      grid[i].ticket     = 0;
+      grid[i].open_price = 0;
+      grid[i].be_moved   = false;
+      grid[i].is_open    = false;
+   }
+}
+
+//+------------------------------------------------------------------+
+void SyncGridState(GridLevel &grid[], int magic, long pos_type, int &count)
+{
+   count = 0;
+   for(int i = 0; i < Max_Grid_Levels; i++)
+   {
+      if(!grid[i].is_open) continue;
+      if(PositionSelectByTicket(grid[i].ticket))
+         count++;
+      else
+      {
+         // Lenh da dong - tinh realized PnL
+         // (Da duoc xu ly trong OnTradeTransaction, o day chi reset slot)
+         grid[i].is_open    = false;
+         grid[i].ticket     = 0;
+         grid[i].be_moved   = false;
+         grid[i].open_price = 0;
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// Quan ly TP/SL theo gia (price units)
+//+------------------------------------------------------------------+
+void ManageTpSl(GridLevel &grid[], long pos_type)
+{
+   for(int i = 0; i < Max_Grid_Levels; i++)
+   {
+      if(!grid[i].is_open) continue;
+      if(!PositionSelectByTicket(grid[i].ticket)) continue;
+
+      double open_p  = grid[i].open_price;
+      double cur_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double cur_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double pnl_price = 0;
+
+      if(pos_type == POSITION_TYPE_BUY)
+         pnl_price = cur_bid - open_p;
+      else
+         pnl_price = open_p - cur_ask;
+
+      if(pnl_price >= TP_Price)
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         Print("EMAGrid: TP #", grid[i].ticket, " +", DoubleToString(pnl_price, _Digits), " gia | $", DoubleToString(profit, 2));
+         if(trade.PositionClose(grid[i].ticket))
+            RecordClosedPnL(profit);
+      }
+      else if(pnl_price <= -SL_Price)
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         Print("EMAGrid: SL #", grid[i].ticket, " ", DoubleToString(pnl_price, _Digits), " gia | $", DoubleToString(profit, 2));
+         if(trade.PositionClose(grid[i].ticket))
+            RecordClosedPnL(profit);
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// Ghi nhan loi/lo lenh da dong
+//+------------------------------------------------------------------+
+void RecordClosedPnL(double profit)
+{
+   if(profit >= 0)
+      g_total_profit += profit;
+   else
+      g_total_loss += MathAbs(profit);
+}
+
+//+------------------------------------------------------------------+
+// Quan ly Breakeven
+//+------------------------------------------------------------------+
+void ManageBreakeven(GridLevel &grid[], long pos_type)
+{
+   for(int i = 0; i < Max_Grid_Levels; i++)
+   {
+      if(!grid[i].is_open || grid[i].be_moved) continue;
+      if(!PositionSelectByTicket(grid[i].ticket)) continue;
+
+      double open_p  = grid[i].open_price;
+      double cur_bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      double cur_ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      double pnl_price = 0;
+
+      if(pos_type == POSITION_TYPE_BUY)
+         pnl_price = cur_bid - open_p;
+      else
+         pnl_price = open_p - cur_ask;
+
+      if(pnl_price < BE_TriggerPrice) continue;
+
+      // Tinh lock pip tuong duong BE_LockDollar
+      double lot       = NormalizeLot(LotSize);
+      double tick_val  = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_VALUE);
+      double tick_size = SymbolInfoDouble(_Symbol, SYMBOL_TRADE_TICK_SIZE);
+      double lock_price = 0;
+      if(tick_val > 0 && tick_size > 0 && lot > 0)
+         lock_price = BE_LockDollar / ((1.0 / tick_size) * tick_val * lot);
+
+      double new_sl = 0;
+      double cur_tp = PositionGetDouble(POSITION_TP);
+      double cur_sl = PositionGetDouble(POSITION_SL);
+
+      if(pos_type == POSITION_TYPE_BUY)
+      {
+         new_sl = NormalizeDouble(open_p + lock_price, _Digits);
+         if(new_sl <= cur_sl) continue;
+      }
+      else
+      {
+         new_sl = NormalizeDouble(open_p - lock_price, _Digits);
+         if(new_sl >= cur_sl) continue;
+      }
+
+      if(trade.PositionModify(grid[i].ticket, new_sl, cur_tp))
+      {
+         grid[i].be_moved = true;
+         Print("EMAGrid: BE #", grid[i].ticket, " SL -> ", new_sl,
+               " (lock +$", BE_LockDollar, ")");
+      }
+   }
+}
+
+//+------------------------------------------------------------------+
+// Mo lenh DCA theo timer + khoang cach gia
+//+------------------------------------------------------------------+
+void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
+                   int &count, datetime &last_open_time, double &last_open_price)
+{
+   if(count >= Max_Grid_Levels) return;
+
+   datetime now = TimeCurrent();
+
+   // Dieu kien: du thoi gian
+   if(last_open_time != 0)
+      if((int)(now - last_open_time) < DCA_IntervalMin * 60) return;
+
+   // Dieu kien: gia cach lenh truoc >= DCA_PriceDistance
+   if(last_open_price > 0)
+   {
+      double cur_price = (direction == 1)
+                         ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
+                         : SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      if(MathAbs(cur_price - last_open_price) < DCA_PriceDistance) return;
+   }
+
+   // Tim slot trong
+   int slot = -1;
+   for(int i = 0; i < Max_Grid_Levels; i++)
+      if(!grid[i].is_open) { slot = i; break; }
+   if(slot < 0) return;
+
+   double lot    = NormalizeLot(LotSize);
+   double price  = 0;
+   double tp     = 0;
+   double sl     = 0;
+
+   if(direction == 1)  // BUY
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+      tp    = NormalizeDouble(price + TP_Price, _Digits);
+      sl    = NormalizeDouble(price - SL_Price, _Digits);
+   }
+   else  // SELL
+   {
+      price = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+      tp    = NormalizeDouble(price - TP_Price, _Digits);
+      sl    = NormalizeDouble(price + SL_Price, _Digits);
+   }
+
+   MqlTradeRequest req = {};
+   MqlTradeResult  res = {};
+   req.action  = TRADE_ACTION_DEAL;
+   req.symbol  = _Symbol;
+   req.volume  = lot;
+   req.price   = price;
+   req.tp      = tp;
+   req.sl      = sl;
+   req.magic   = magic;
+   req.type    = (direction == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   req.comment = "EMAGrid " + (direction == 1 ? "Buy" : "Sell") + " L" + IntegerToString(slot + 1);
+
+   if(!OrderSend(req, res))
+   {
+      Print("EMAGrid: OrderSend error ", GetLastError());
+      return;
+   }
+   if(res.retcode != TRADE_RETCODE_DONE && res.retcode != TRADE_RETCODE_PLACED)
+   {
+      Print("EMAGrid: retcode ", res.retcode);
+      return;
+   }
+
+   // MT5: dung res.deal de tim position ticket chinh xac
+   // res.order co the khac ticket position sau khi fill
+   ulong pos_ticket = 0;
+   if(res.deal > 0 && HistoryDealSelect(res.deal))
+      pos_ticket = (ulong)HistoryDealGetInteger(res.deal, DEAL_POSITION_ID);
+
+   // Fallback: tim position moi nhat cung magic + symbol
+   if(pos_ticket == 0)
+   {
+      long ptype = (direction == 1) ? POSITION_TYPE_BUY : POSITION_TYPE_SELL;
+      for(int k = PositionsTotal() - 1; k >= 0; k--)
+      {
+         ulong t = PositionGetTicket(k);
+         if(t == 0) continue;
+         if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+         if(PositionGetInteger(POSITION_MAGIC)  != magic)  continue;
+         if(PositionGetInteger(POSITION_TYPE)   != ptype)  continue;
+         pos_ticket = t;
+         break;
+      }
+   }
+
+   if(pos_ticket == 0)
+   {
+      Print("EMAGrid: Canh bao - khong tim duoc position ticket!");
+      return;
+   }
+
+   grid[slot].ticket     = pos_ticket;
+   grid[slot].open_price = price;
+   grid[slot].be_moved   = false;
+   grid[slot].is_open    = true;
+   last_open_time        = now;
+   last_open_price       = price;
+   count++;
+   g_total_orders++;
+
+   Print("EMAGrid: Mo ", req.comment, " @ ", price,
+         " TP=", tp, " SL=", sl,
+         " ticket=", pos_ticket,
+         " | Tong lenh session: ", g_total_orders);
+}
+
+//+------------------------------------------------------------------+
+void RequestStartBuyGrid()
+{
+   if(TradingDirection == DIRECTION_SELL_ONLY) return;
+   if(buy_grid_active) return;
+   buy_grid_active   = true;
+   active_buy_levels = 0;
+   g_last_buy_open   = 0;
+   g_last_buy_price  = 0;
+   ResetGrid(buy_grid);
+   Print("EMAGrid: Start BUY grid");
+}
+
+//+------------------------------------------------------------------+
+void RequestStartSellGrid()
+{
+   if(TradingDirection == DIRECTION_BUY_ONLY) return;
+   if(sell_grid_active) return;
+   sell_grid_active   = true;
+   active_sell_levels = 0;
+   g_last_sell_open   = 0;
+   g_last_sell_price  = 0;
+   ResetGrid(sell_grid);
+   Print("EMAGrid: Start SELL grid");
+}
+
+//+------------------------------------------------------------------+
+void CloseAllBuyPositions()
+{
+   for(int i = Max_Grid_Levels - 1; i >= 0; i--)
+   {
+      if(!buy_grid[i].is_open) continue;
+      if(PositionSelectByTicket(buy_grid[i].ticket))
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         if(trade.PositionClose(buy_grid[i].ticket))
+            RecordClosedPnL(profit);
+      }
+   }
+   buy_grid_active   = false;
+   active_buy_levels = 0;
+   g_last_buy_open   = 0;
+   g_last_buy_price  = 0;
+   ResetGrid(buy_grid);
+}
+
+//+------------------------------------------------------------------+
+void CloseAllSellPositions()
+{
+   for(int i = Max_Grid_Levels - 1; i >= 0; i--)
+   {
+      if(!sell_grid[i].is_open) continue;
+      if(PositionSelectByTicket(sell_grid[i].ticket))
+      {
+         double profit = PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+         if(trade.PositionClose(sell_grid[i].ticket))
+            RecordClosedPnL(profit);
+      }
+   }
+   sell_grid_active   = false;
+   active_sell_levels = 0;
+   g_last_sell_open   = 0;
+   g_last_sell_price  = 0;
+   ResetGrid(sell_grid);
+}
+
+//+------------------------------------------------------------------+
+void ResetStats()
+{
+   g_total_orders = 0;
+   g_total_profit = 0;
+   g_total_loss   = 0;
+   Print("EMAGrid: Stats da duoc reset");
+}
+
+//+------------------------------------------------------------------+
+// UI - Stats Label
+//+------------------------------------------------------------------+
+void CreateStatsLabel()
+{
+   if(ObjectFind(0, LBL_STATS) >= 0) return;
+   ENUM_BASE_CORNER corner = ButtonCornerTop ? CORNER_LEFT_UPPER : CORNER_LEFT_LOWER;
+   int x = ButtonOffsetX;
+   int y = ButtonOffsetY + (ButtonHeight + ButtonGap) * 6 + 6;
+   ObjectCreate(0, LBL_STATS, OBJ_LABEL, 0, 0, 0);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_CORNER,     corner);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_XDISTANCE,  x);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_YDISTANCE,  y);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_COLOR,      clrYellow);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_FONTSIZE,   9);
+   ObjectSetString(0,  LBL_STATS, OBJPROP_FONT,       "Arial Bold");
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_SELECTABLE, false);
+   ObjectSetString(0,  LBL_STATS, OBJPROP_TEXT,       "Lenh: 0");
+}
+
+//+------------------------------------------------------------------+
+void UpdateStatsLabel()
+{
+   if(ObjectFind(0, LBL_STATS) < 0) CreateStatsLabel();
+   string txt = "Lenh: " + IntegerToString(g_total_orders);
+   ObjectSetString(0,  LBL_STATS, OBJPROP_TEXT,  txt);
+   ObjectSetInteger(0, LBL_STATS, OBJPROP_COLOR, clrYellow);
+}
+
+//+------------------------------------------------------------------+
+// UI - Buttons
+//+------------------------------------------------------------------+
+void CreateOrUpdateButtons()
+{
+   ENUM_BASE_CORNER corner = ButtonCornerTop ? CORNER_LEFT_UPPER : CORNER_LEFT_LOWER;
+   int y = ButtonOffsetY;
+   int x = ButtonOffsetX;
+   int h = ButtonHeight + ButtonGap;
+
+   CreateButton(BTN_START_BUY,  "Start BUY",  x, y, corner); y += h;
+   CreateButton(BTN_CLOSE_BUY,  "Close BUY",  x, y, corner); y += h;
+   CreateButton(BTN_START_SELL, "Start SELL", x, y, corner); y += h;
+   CreateButton(BTN_CLOSE_SELL, "Close SELL", x, y, corner); y += h;
+   CreateButton(BTN_CLOSE_ALL,  "Close ALL",  x, y, corner); y += h;
+   CreateButton(BTN_RESET,      "RESET",      x, y, corner);
+
+   UpdateButtonAppearance();
+}
+
+//+------------------------------------------------------------------+
+void CreateButton(const string name, const string text, const int xdist, const int ydist,
+                  const ENUM_BASE_CORNER corner)
+{
+   if(ObjectFind(0, name) >= 0) { ObjectSetString(0, name, OBJPROP_TEXT, text); return; }
+   if(!ObjectCreate(0, name, OBJ_BUTTON, 0, 0, 0)) return;
+   ObjectSetInteger(0, name, OBJPROP_CORNER,       corner);
+   ObjectSetInteger(0, name, OBJPROP_XDISTANCE,    xdist);
+   ObjectSetInteger(0, name, OBJPROP_YDISTANCE,    ydist);
+   ObjectSetInteger(0, name, OBJPROP_XSIZE,        ButtonWidth);
+   ObjectSetInteger(0, name, OBJPROP_YSIZE,        ButtonHeight);
+   ObjectSetString(0,  name, OBJPROP_TEXT,         text);
+   ObjectSetInteger(0, name, OBJPROP_COLOR,        clrWhite);
+   ObjectSetInteger(0, name, OBJPROP_BGCOLOR,      clrDimGray);
+   ObjectSetInteger(0, name, OBJPROP_BORDER_COLOR, clrSilver);
+   ObjectSetInteger(0, name, OBJPROP_SELECTABLE,   false);
+}
+
+//+------------------------------------------------------------------+
+void UpdateButtonAppearance()
+{
+   bool allow_buy  = (TradingDirection != DIRECTION_SELL_ONLY);
+   bool allow_sell = (TradingDirection != DIRECTION_BUY_ONLY);
+   color buy_bg    = buy_grid_active  ? clrDarkGreen : clrGreen;
+   color sell_bg   = sell_grid_active ? clrMaroon    : clrFireBrick;
+
+   if(ObjectFind(0, BTN_START_BUY) >= 0)
+   {
+      ObjectSetInteger(0, BTN_START_BUY, OBJPROP_BGCOLOR, allow_buy ? buy_bg : clrGray);
+      string lbl = "Buy " + IntegerToString(active_buy_levels) + "/" + IntegerToString(Max_Grid_Levels);
+      ObjectSetString(0, BTN_START_BUY, OBJPROP_TEXT, lbl);
+   }
+   if(ObjectFind(0, BTN_START_SELL) >= 0)
+   {
+      ObjectSetInteger(0, BTN_START_SELL, OBJPROP_BGCOLOR, allow_sell ? sell_bg : clrGray);
+      string lbl = "Sell " + IntegerToString(active_sell_levels) + "/" + IntegerToString(Max_Grid_Levels);
+      ObjectSetString(0, BTN_START_SELL, OBJPROP_TEXT, lbl);
+   }
+   if(ObjectFind(0, BTN_RESET) >= 0)
+      ObjectSetInteger(0, BTN_RESET, OBJPROP_BGCOLOR, clrDarkSlateBlue);
+}
+
+//+------------------------------------------------------------------+
+void OnChartEvent(const int id, const long &lparam, const double &dparam, const string &sparam)
+{
+   if(id != CHARTEVENT_OBJECT_CLICK) return;
+
+   if(sparam == BTN_START_BUY)
+   {
+      ObjectSetInteger(0, BTN_START_BUY, OBJPROP_STATE, false);
+      if(!buy_grid_active) RequestStartBuyGrid();
+      // Vao lenh tay ngay, bo qua timer
+      g_last_buy_open = 0;
+      DCA_TimerOpen(buy_grid, BuyMagicNumber, 1, active_buy_levels,
+                    g_last_buy_open, g_last_buy_price);
+   }
+   else if(sparam == BTN_START_SELL)
+   {
+      ObjectSetInteger(0, BTN_START_SELL, OBJPROP_STATE, false);
+      if(!sell_grid_active) RequestStartSellGrid();
+      // Vao lenh tay ngay, bo qua timer
+      g_last_sell_open = 0;
+      DCA_TimerOpen(sell_grid, SellMagicNumber, -1, active_sell_levels,
+                    g_last_sell_open, g_last_sell_price);
+   }
+   else if(sparam == BTN_CLOSE_BUY)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_BUY, OBJPROP_STATE, false);
+      CloseAllBuyPositions();
+   }
+   else if(sparam == BTN_CLOSE_SELL)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_SELL, OBJPROP_STATE, false);
+      CloseAllSellPositions();
+   }
+   else if(sparam == BTN_CLOSE_ALL)
+   {
+      ObjectSetInteger(0, BTN_CLOSE_ALL, OBJPROP_STATE, false);
+      CloseAllBuyPositions();
+      CloseAllSellPositions();
+   }
+   else if(sparam == BTN_RESET)
+   {
+      ObjectSetInteger(0, BTN_RESET, OBJPROP_STATE, false);
+      ResetStats();
+   }
+
+   UpdateButtonAppearance();
+   UpdateStatsLabel();
+   ChartRedraw();
+}
+//+------------------------------------------------------------------+
