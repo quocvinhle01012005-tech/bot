@@ -435,13 +435,16 @@ void DCA_TimerOpen(GridLevel &grid[], int magic, int direction,
    if(last_open_time != 0)
       if((int)(now - last_open_time) < DCA_IntervalMin * 60) return;
 
-   // Dieu kien: gia cach lenh truoc >= DCA_PriceDistance
-   if(last_open_price > 0)
+   // Dieu kien: gia phai cach TAT CA lenh dang mo >= DCA_PriceDistance
    {
       double cur_price = (direction == 1)
                          ? SymbolInfoDouble(_Symbol, SYMBOL_ASK)
                          : SymbolInfoDouble(_Symbol, SYMBOL_BID);
-      if(MathAbs(cur_price - last_open_price) < DCA_PriceDistance) return;
+      for(int k = 0; k < Max_Grid_Levels; k++)
+      {
+         if(!grid[k].is_open) continue;
+         if(MathAbs(cur_price - grid[k].open_price) < DCA_PriceDistance) return;
+      }
    }
 
    // Tim slot trong
