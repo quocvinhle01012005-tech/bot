@@ -178,21 +178,28 @@ void OnTick()
 {
    CheckEMACross();
 
-   if(buy_grid_active)
+   // Quan ly lenh buy: luon chay Sync/BE/TP/SL neu con lenh mo
+   // DCA chi chay khi buy_grid_active = true
+   if(active_buy_levels > 0 || buy_grid_active)
    {
       SyncGridState(buy_grid,  BuyMagicNumber,  POSITION_TYPE_BUY,  active_buy_levels);
       ManageBreakeven(buy_grid,  POSITION_TYPE_BUY);
       ManageTpSl(buy_grid,  POSITION_TYPE_BUY);
-      DCA_TimerOpen(buy_grid,  BuyMagicNumber,  1,  active_buy_levels,
-                    g_last_buy_open,  g_last_buy_price);
+      if(buy_grid_active)
+         DCA_TimerOpen(buy_grid, BuyMagicNumber, 1, active_buy_levels,
+                       g_last_buy_open, g_last_buy_price);
    }
-   if(sell_grid_active)
+
+   // Quan ly lenh sell: luon chay Sync/BE/TP/SL neu con lenh mo
+   // DCA chi chay khi sell_grid_active = true
+   if(active_sell_levels > 0 || sell_grid_active)
    {
       SyncGridState(sell_grid, SellMagicNumber, POSITION_TYPE_SELL, active_sell_levels);
       ManageBreakeven(sell_grid, POSITION_TYPE_SELL);
       ManageTpSl(sell_grid, POSITION_TYPE_SELL);
-      DCA_TimerOpen(sell_grid, SellMagicNumber, -1, active_sell_levels,
-                    g_last_sell_open, g_last_sell_price);
+      if(sell_grid_active)
+         DCA_TimerOpen(sell_grid, SellMagicNumber, -1, active_sell_levels,
+                       g_last_sell_open, g_last_sell_price);
    }
 
    UpdateButtonAppearance();
@@ -233,28 +240,34 @@ void CheckEMACross()
       if(cur_state == 1 && g_prev_cross != 1)
       {
          // EMA fast cat len slow -> BUY signal
+         // Dung DCA SELL - khong mo them lenh sell moi
+         sell_grid_active = false;
+         Print("EMAGrid: EMA cross UP - STOP SELL DCA, START BUY");
+
          if(TradingDirection != DIRECTION_SELL_ONLY)
          {
             if(!buy_grid_active)
                RequestStartBuyGrid();
-            else
-               TriggerDCABuy();
+            // Reset timer de DCA buy ngay lap tuc
+            g_last_buy_open = 0;
          }
          g_prev_cross = 1;
-         Print("EMAGrid: EMA cross UP - BUY signal");
       }
       else if(cur_state == -1 && g_prev_cross != -1)
       {
          // EMA fast cat xuong slow -> SELL signal
+         // Dung DCA BUY - khong mo them lenh buy moi
+         buy_grid_active = false;
+         Print("EMAGrid: EMA cross DOWN - STOP BUY DCA, START SELL");
+
          if(TradingDirection != DIRECTION_BUY_ONLY)
          {
             if(!sell_grid_active)
                RequestStartSellGrid();
-            else
-               TriggerDCASell();
+            // Reset timer de DCA sell ngay lap tuc
+            g_last_sell_open = 0;
          }
          g_prev_cross = -1;
-         Print("EMAGrid: EMA cross DOWN - SELL signal");
       }
    }
 
