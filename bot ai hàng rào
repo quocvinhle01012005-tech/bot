@@ -297,18 +297,7 @@ void OnTick()
       }
       else if(buys > 0 && buys < MaxOrders)
       {
-         double lowest_buy = 999999;
-         for(int i = 0; i < PositionsTotal(); i++)
-         {
-            ulong ticket = PositionGetTicket(i);
-            if(ticket == 0) continue;
-            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
-            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_BUY) continue;
-            double op = PositionGetDouble(POSITION_PRICE_OPEN);
-            if(op < lowest_buy) lowest_buy = op;
-         }
-         if(bid < lowest_buy - DCA_Distance && IsPriceZoneClear(ask, POSITION_TYPE_BUY))
+         if(IsPriceZoneClear(ask, POSITION_TYPE_BUY))
          {
             trade.Buy(Lot);
             g_total_orders++;
