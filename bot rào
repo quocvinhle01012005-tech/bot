@@ -1,10 +1,11 @@
 //+------------------------------------------------------------------+
 //| EMA + DCA BOT + UI BUTTONS                                       |
 //| Chot loi theo tong lot / Lot x TP                                |
-//| Hedge can bang: dung DCA, cho lenh thao rao theo gia vs moc      |
+//| Hedge can bang: lenh rao dung MagicNumber rieng, ngoai MaxOrders |
 //+------------------------------------------------------------------+
 #include <Trade/Trade.mqh>
 CTrade trade;
+CTrade trade_hedge;  // CTrade rieng cho lenh hang rao
 
 input double Lot              = 0.01;
 input int    MaxOrders        = 20;
@@ -14,13 +15,12 @@ input int    EMA_Slow         = 200;
 input int    MagicNumber      = 123456;
 
 input group "=== CHOT LOI THEO LOT ==="
-input int    DCA_Threshold       = 10;   // Nguong so lenh doi he so
-input double TP_Multiplier_Low   = 7.0;   // $ chot loi moi 0.01 lot khi <= nguong
-input double TP_Multiplier_High  = 15.0;  // $ chot loi moi 0.01 lot khi > nguong
+input int    DCA_Threshold       = 10;
+input double TP_Multiplier_Low   = 7.0;
+input double TP_Multiplier_High  = 15.0;
 
 input group "=== HEDGE CAN BANG ==="
 input double Hedge_Drawdown  = 0.0;   // % DD kich hoat hedge (0 = tat)
-// Hang rao: tu tinh = chenh lech x 0.01 | Thao rao: co dinh 0.01
 
 input group "=== CHART BUTTONS ==="
 input bool   ButtonCornerTop = true;
@@ -36,7 +36,10 @@ bool   g_sell_opened       = false;
 bool   g_hedge_active      = false;
 double g_hedge_price       = 0;
 long   g_hedge_type        = -1;
-bool   g_thao_rao_opened   = false;  // Da mo lenh thao rao chua
+bool   g_thao_rao_opened   = false;
+
+// MagicNumber cho lenh hang rao (ngoai MaxOrders)
+int    MagicHedge = MagicNumber + 1;
 
 const string BTN_BUY        = "EMA_BtnBuy";
 const string BTN_CLOSE_BUY  = "EMA_BtnCloseBuy";
@@ -49,6 +52,8 @@ const string LBL_STATS      = "EMA_LblStats";
 int OnInit()
 {
    trade.SetExpertMagicNumber(MagicNumber);
+   trade_hedge.SetExpertMagicNumber(MagicNumber + 1);
+   MagicHedge = MagicNumber + 1;
    g_total_orders    = 0;
    g_buy_opened      = false;
    g_sell_opened     = false;
@@ -119,6 +124,19 @@ double TotalLotByType(long pos_type)
    return total_lot;
 }
 
+// Kiem tra lenh hang rao con ton tai khong
+bool HedgeOrderExists()
+{
+   for(int i = 0; i < PositionsTotal(); i++)
+   {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) == MagicHedge) return true;
+   }
+   return false;
+}
+
 //+------------------------------------------------------------------+
 void OnTick()
 {
@@ -143,6 +161,16 @@ void OnTick()
       g_thao_rao_opened = false;
    }
 
+   // Reset hedge neu lenh rao da bi dong tay
+   if(g_hedge_active && !HedgeOrderExists())
+   {
+      g_hedge_active    = false;
+      g_hedge_price     = 0;
+      g_hedge_type      = -1;
+      g_thao_rao_opened = false;
+      Print("EMA HEDGE: Lenh rao da dong, reset hedge");
+   }
+
    // --- KICH HOAT HEDGE (1 lan, khong lap lai) ---
    if(Hedge_Drawdown > 0 && !g_hedge_active && drawdown >= Hedge_Drawdown)
    {
@@ -154,7 +182,7 @@ void OnTick()
          double hedge_lot = NormalizeDouble(diff * Lot, 2);
          Print("EMA HEDGE: Mo SELL hang rao lot=", hedge_lot,
                " (chenh=", diff, " x ", Lot, ") Buy=", buys, " Sell=", sells);
-         trade.Sell(hedge_lot);
+         trade_hedge.Sell(hedge_lot);
          g_hedge_price = bid;
          g_hedge_type  = POSITION_TYPE_SELL;
          g_sell_opened = true;
@@ -165,7 +193,7 @@ void OnTick()
          double hedge_lot = NormalizeDouble(add * Lot, 2);
          Print("EMA HEDGE: Mo BUY hang rao lot=", hedge_lot,
                " (chenh=", add, " x ", Lot, ") Buy=", buys, " Sell=", sells);
-         trade.Buy(hedge_lot);
+         trade_hedge.Buy(hedge_lot);
          g_hedge_price = ask;
          g_hedge_type  = POSITION_TYPE_BUY;
          g_buy_opened  = true;
@@ -179,68 +207,8 @@ void OnTick()
 
       g_hedge_active    = true;
       g_thao_rao_opened = false;
+      Print("EMA HEDGE: Hang rao da mo, tu thao tay bang nut Close tren chart");
       RefreshUI();
-      return;  // Dung lai, tick sau xu ly tiep
-   }
-
-   // --- DANG HEDGE: dung DCA, tat chot loi $, mo lenh thao rao ---
-   if(g_hedge_active && g_hedge_price > 0)
-   {
-      buys  = CountByType(POSITION_TYPE_BUY);
-      sells = CountByType(POSITION_TYPE_SELL);
-
-      // Kiem tra tin hieu thao rao (gia vs moc + EMA dung chieu)
-      bool signal_close_buy  = (price > g_hedge_price && emaFast < emaSlow && buys  > 0);
-      bool signal_close_sell = (price < g_hedge_price && emaFast > emaSlow && sells > 0);
-
-      // Mo lenh thao rao neu chua mo (chi de lam dau hieu, khong bat buoc thanh cong)
-      if(!g_thao_rao_opened)
-      {
-         if(signal_close_buy)
-         {
-            Print("EMA THAO RAO: Gia tang, mo SELL lot=", Lot);
-            trade.Sell(Lot);
-            g_thao_rao_opened = true;
-            g_sell_opened     = true;
-         }
-         else if(signal_close_sell)
-         {
-            Print("EMA THAO RAO: Gia giam, mo BUY lot=", Lot);
-            trade.Buy(Lot);
-            g_thao_rao_opened = true;
-            g_buy_opened      = true;
-         }
-      }
-
-      // Dong chieu lo ngay khi co tin hieu, khong phu thuoc lenh thao rao mo thanh cong
-      buys  = CountByType(POSITION_TYPE_BUY);
-      sells = CountByType(POSITION_TYPE_SELL);
-
-      if(signal_close_buy && buys > 0)
-      {
-         // Gia tang + tin hieu SELL: dong het BUY, giu SELL
-         Print("EMA THAO RAO: Dong het BUY (", buys, " lenh)");
-         CloseByType(POSITION_TYPE_BUY);
-         g_buy_opened      = false;
-         g_hedge_active    = false;
-         g_hedge_price     = 0;
-         g_hedge_type      = -1;
-         g_thao_rao_opened = false;
-      }
-      else if(signal_close_sell && sells > 0)
-      {
-         // Gia giam + tin hieu BUY: dong het SELL, giu BUY
-         Print("EMA THAO RAO: Dong het SELL (", sells, " lenh)");
-         CloseByType(POSITION_TYPE_SELL);
-         g_sell_opened     = false;
-         g_hedge_active    = false;
-         g_hedge_price     = 0;
-         g_hedge_type      = -1;
-         g_thao_rao_opened = false;
-      }
-
-      RefreshUI();
-      return;  // Dang hedge: khong DCA, khong chot loi $
    }
 
    // --- CHOT LOI THEO LOT (chi khi khong hedge) ---
@@ -297,7 +265,31 @@ void OnTick()
       }
       else if(buys > 0 && buys < MaxOrders)
       {
-         if(IsPriceZoneClear(ask, POSITION_TYPE_BUY))
+         double lowest_buy = 999999;
+         for(int i = 0; i < PositionsTotal(); i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_BUY) continue;
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(op < lowest_buy) lowest_buy = op;
+         }
+         double highest_buy = 0;
+         for(int i = 0; i < PositionsTotal(); i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_BUY) continue;
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(op > highest_buy) highest_buy = op;
+         }
+         bool dca_buy_down = (bid < lowest_buy - DCA_Distance);
+         bool dca_buy_up   = (ask > highest_buy + DCA_Distance);
+         if((dca_buy_down || dca_buy_up) && IsPriceZoneClear(ask, POSITION_TYPE_BUY))
          {
             trade.Buy(Lot);
             g_total_orders++;
@@ -329,7 +321,20 @@ void OnTick()
             double op = PositionGetDouble(POSITION_PRICE_OPEN);
             if(op > highest_sell) highest_sell = op;
          }
-         if(ask > highest_sell + DCA_Distance && IsPriceZoneClear(bid, POSITION_TYPE_SELL))
+         double lowest_sell = 999999;
+         for(int i = 0; i < PositionsTotal(); i++)
+         {
+            ulong ticket = PositionGetTicket(i);
+            if(ticket == 0) continue;
+            if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+            if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+            if(PositionGetInteger(POSITION_TYPE)  != POSITION_TYPE_SELL) continue;
+            double op = PositionGetDouble(POSITION_PRICE_OPEN);
+            if(op < lowest_sell) lowest_sell = op;
+         }
+         bool dca_sell_up   = (ask > highest_sell + DCA_Distance);
+         bool dca_sell_down = (bid < lowest_sell - DCA_Distance);
+         if((dca_sell_up || dca_sell_down) && IsPriceZoneClear(bid, POSITION_TYPE_SELL))
          {
             trade.Sell(Lot);
             g_total_orders++;
@@ -445,12 +450,14 @@ double TotalProfit()
 
 void CloseAll()
 {
+   // Dong lenh thuong
    for(int i = PositionsTotal() - 1; i >= 0; i--)
    {
       ulong ticket = PositionGetTicket(i);
       if(ticket == 0) continue;
       if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
-      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != MagicNumber &&
+         PositionGetInteger(POSITION_MAGIC) != MagicHedge) continue;
       trade.PositionClose(ticket);
    }
 }
