@@ -1,0 +1,496 @@
+//+------------------------------------------------------------------+
+//|                                            EMA_Grid_Fibo.mq5      |
+//|  Clone EA: Buy Stop / Sell Stop hai chieu (OCO) + DCA Fibonacci   |
+//|  + TP chung cho ca basket, tu dong dat lai sau khi dong lenh      |
+//|                                                                    |
+//|  CANH BAO RUI RO:                                                  |
+//|  EA nay dung chien luoc Martingale/Grid khong gioi han so lan     |
+//|  DCA. Day la chien luoc RAT RUI RO - co the chay sach tai khoan   |
+//|  trong 1 cu truot gia manh khong hoi lai. CHI dung tren tai khoan |
+//|  DEMO de hoc tap, KHONG khuyen khich dung tien that.               |
+//+------------------------------------------------------------------+
+#property copyright "Clone theo yeu cau nguoi dung - chi de tham khao/hoc tap"
+#property version   "1.00"
+#property strict
+
+#include <Trade\Trade.mqh>
+CTrade trade;
+
+//================== INPUT PARAMETERS ==================
+input group "=== Khoi tao lenh dau (Buy Stop / Sell Stop) ==="
+input double InpInitialLot        = 0.01;   // Lot lenh dau tien
+input double InpStopDistance      = 1.0;    // Khoang cach Buy Stop/Sell Stop tu gia hien tai (theo gia, vd 1.0 = 1 USD voi XAUUSD)
+input double InpInitialTPDistance = 1.0;    // Khoang cach TP tu gia Stop (vd 1.0 USD)
+
+input group "=== DCA (Nhoi lenh khi gia di nguoc) ==="
+input double InpDCAStepDistance   = 1.0;    // Khoang cach gia giua moi lan DCA (vd 1.0 USD) - INPUT theo yeu cau
+input int    InpMaxDCALevels      = 0;      // So lan DCA toi da (0 = KHONG GIOI HAN, chay den khi het margin)
+input bool   InpUseFibonacciLots  = true;   // Dung day Fibonacci cho khoi luong DCA (1,2,3,5,8,13,21,34,55,89,144...)
+
+input group "=== TP/SL chung cho ca basket ==="
+input double InpBasketTPDistance  = 1.0;    // Khoang cach TP tinh tu gia trung binh (average price) cua basket
+input double InpBasketSLMoney     = 0;      // Stop loss theo tien (USD) cho ca basket, 0 = tat (KHONG GIOI HAN theo yeu cau)
+
+input group "=== Khac ==="
+input ulong  InpMagicNumber       = 778899; // Magic number rieng cho EA nay
+input string InpTradeComment      = "EMA_Grid_Fibo";
+
+//================== GLOBAL VARIABLES ==================
+int    fiboSeq[30];          // Day Fibonacci de tinh lot
+ulong  pendingBuyTicket  = 0;
+ulong  pendingSellTicket = 0;
+bool   basketActive      = false;  // dang co basket lenh thi truong (sau khi 1 ben Stop khop)
+int    basketDirection   = 0;      // 1 = BUY, -1 = SELL
+int    dcaCount          = 0;      // so lenh DCA da vao (khong tinh lenh dau)
+bool   dcaBlockedInsufficientMargin = false; // true neu da gap loi het margin, dung han DCA cho basket nay
+double lastDCAPrice      = 0;      // gia cua lan DCA CUOI CUNG (de tranh DCA trung gia khi gia bounce)
+
+//+------------------------------------------------------------------+
+int OnInit()
+  {
+   // Khoi tao day Fibonacci: 1,2,3,5,8,13,21,34,55,89,144...
+   fiboSeq[0] = 1;
+   fiboSeq[1] = 2;
+   for(int i = 2; i < 30; i++)
+      fiboSeq[i] = fiboSeq[i-1] + fiboSeq[i-2];
+
+   trade.SetExpertMagicNumber(InpMagicNumber);
+
+   Print("=== EA KHOI DONG ===");
+   Print("CANH BAO: EA dung chien luoc Martingale/Grid KHONG GIOI HAN DCA.");
+   Print("Co the gay lo lon hoac mat het tai khoan trong xu huong manh.");
+   Print("Chi nen dung tren tai khoan DEMO.");
+
+   // Neu chua co lenh/pending nao cua EA nay -> dat cap Stop dau tien
+   if(!HasAnyEAOrderOrPosition())
+      PlaceInitialStopPair();
+
+   return(INIT_SUCCEEDED);
+  }
+
+//+------------------------------------------------------------------+
+void OnDeinit(const int reason)
+  {
+  }
+
+//+------------------------------------------------------------------+
+//| Kiem tra EA da co lenh cho/lenh thi truong nao chua                |
+//+------------------------------------------------------------------+
+bool HasAnyEAOrderOrPosition()
+  {
+   // kiem tra pending orders
+   for(int i = OrdersTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = OrderGetTicket(i);
+      if(ticket > 0 && OrderSelect(ticket))
+        {
+         if(OrderGetString(ORDER_SYMBOL) == _Symbol && OrderGetInteger(ORDER_MAGIC) == (long)InpMagicNumber)
+            return true;
+        }
+     }
+   // kiem tra positions
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket > 0 && PositionSelectByTicket(ticket))
+        {
+         if(PositionGetString(POSITION_SYMBOL) == _Symbol && PositionGetInteger(POSITION_MAGIC) == (long)InpMagicNumber)
+            return true;
+        }
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Dat cap Buy Stop + Sell Stop ban dau quanh gia hien tai            |
+//+------------------------------------------------------------------+
+void PlaceInitialStopPair()
+  {
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double point = SymbolInfoDouble(_Symbol, SYMBOL_POINT);
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+
+   double buyStopPrice  = NormalizeDouble(ask + InpStopDistance, digits);
+   double sellStopPrice = NormalizeDouble(bid - InpStopDistance, digits);
+
+   double buyTP  = NormalizeDouble(buyStopPrice + InpInitialTPDistance, digits);
+   double sellTP = NormalizeDouble(sellStopPrice - InpInitialTPDistance, digits);
+
+   trade.BuyStop(InpInitialLot, buyStopPrice, _Symbol, 0, buyTP, ORDER_TIME_GTC, 0, InpTradeComment);
+   pendingBuyTicket = trade.ResultOrder();
+
+   trade.SellStop(InpInitialLot, sellStopPrice, _Symbol, 0, sellTP, ORDER_TIME_GTC, 0, InpTradeComment);
+   pendingSellTicket = trade.ResultOrder();
+
+   basketActive    = false;
+   basketDirection = 0;
+   dcaCount        = 0;
+
+   Print("Da dat cap lenh cho: BuyStop@", buyStopPrice, " TP=", buyTP,
+         " | SellStop@", sellStopPrice, " TP=", sellTP);
+  }
+
+//+------------------------------------------------------------------+
+//| Huy 1 lenh cho theo ticket (neu con ton tai)                       |
+//+------------------------------------------------------------------+
+void DeletePendingIfExists(ulong ticket)
+  {
+   if(ticket == 0) return;
+   if(OrderSelect(ticket))
+      trade.OrderDelete(ticket);
+  }
+
+//+------------------------------------------------------------------+
+//| Lay tong volume va gia trung binh cua basket dang mo (theo huong)  |
+//+------------------------------------------------------------------+
+void GetBasketStats(int direction, double &totalVolume, double &avgPrice, int &count)
+  {
+   totalVolume = 0;
+   avgPrice    = 0;
+   count       = 0;
+   double sumPriceVolume = 0;
+
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+
+      long posType = PositionGetInteger(POSITION_TYPE);
+      if(direction == 1 && posType != POSITION_TYPE_BUY) continue;
+      if(direction == -1 && posType != POSITION_TYPE_SELL) continue;
+
+      double vol   = PositionGetDouble(POSITION_VOLUME);
+      double price = PositionGetDouble(POSITION_PRICE_OPEN);
+
+      totalVolume     += vol;
+      sumPriceVolume  += vol * price;
+      count++;
+     }
+
+   if(totalVolume > 0)
+      avgPrice = sumPriceVolume / totalVolume;
+  }
+
+//+------------------------------------------------------------------+
+//| Dat lai TP cho toan bo cac lenh trong basket (theo gia trung binh) |
+//+------------------------------------------------------------------+
+void UpdateBasketTP(int direction)
+  {
+   double totalVolume, avgPrice;
+   int count;
+   GetBasketStats(direction, totalVolume, avgPrice, count);
+   if(count == 0) return;
+
+   int digits = (int)SymbolInfoInteger(_Symbol, SYMBOL_DIGITS);
+   double newTP;
+   if(direction == 1)
+      newTP = NormalizeDouble(avgPrice + InpBasketTPDistance, digits);
+   else
+      newTP = NormalizeDouble(avgPrice - InpBasketTPDistance, digits);
+
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+
+      long posType = PositionGetInteger(POSITION_TYPE);
+      if(direction == 1 && posType != POSITION_TYPE_BUY) continue;
+      if(direction == -1 && posType != POSITION_TYPE_SELL) continue;
+
+      double curSL = PositionGetDouble(POSITION_SL);
+      trade.PositionModify(ticket, curSL, newTP);
+     }
+
+   Print("Da dac lai TP basket (", (direction==1?"BUY":"SELL"), ") = ", newTP,
+         " | avgPrice=", avgPrice, " | totalVolume=", totalVolume, " | soLenh=", count);
+  }
+
+//+------------------------------------------------------------------+
+//| Tinh lot cho lan DCA thu n (n=1 la lenh dau, n=2 la DCA dau tien)  |
+//+------------------------------------------------------------------+
+double GetDCALot(int dcaIndex) // dcaIndex: 0 = lenh dau, 1 = DCA lan 1, 2 = DCA lan 2...
+  {
+   if(!InpUseFibonacciLots)
+      return InpInitialLot;
+
+   int idx = MathMin(dcaIndex, 29);
+   double lot = InpInitialLot * fiboSeq[idx];
+
+   // Lam tron theo step lot cua sàn
+   double lotStep = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_STEP);
+   double minLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MIN);
+   double maxLot  = SymbolInfoDouble(_Symbol, SYMBOL_VOLUME_MAX);
+
+   lot = MathRound(lot / lotStep) * lotStep;
+   lot = MathMax(lot, minLot);
+   lot = MathMin(lot, maxLot);
+
+   return lot;
+  }
+
+//+------------------------------------------------------------------+
+//| Kiem tra lot tinh ra co du tien (margin) de mo lenh khong          |
+//| QUAN TRONG: tranh loi vong lap vo han khi [not enough money]       |
+//+------------------------------------------------------------------+
+bool HasEnoughMarginForLot(double lot, ENUM_ORDER_TYPE orderType, double price)
+  {
+   double marginRequired = 0;
+   if(!OrderCalcMargin(orderType, _Symbol, lot, price, marginRequired))
+      return false;
+
+   double freeMargin = AccountInfoDouble(ACCOUNT_MARGIN_FREE);
+   // de mot khoang đem an toan 5% phong rung gia/spread thay doi
+   return (marginRequired < freeMargin * 0.95);
+  }
+
+//+------------------------------------------------------------------+
+//| Kiem tra va thuc hien DCA neu gia da di nguoc du khoang cach        |
+//+------------------------------------------------------------------+
+void CheckAndDoDCA()
+  {
+   if(!basketActive || basketDirection == 0) return;
+   if(InpMaxDCALevels > 0 && dcaCount >= InpMaxDCALevels) return; // co gioi han (mac dinh 0 = khong gioi han)
+   if(dcaBlockedInsufficientMargin) return; // da het margin truoc do, khong thu DCA nua cho basket nay
+
+   double totalVolume, avgPrice;
+   int count;
+   GetBasketStats(basketDirection, totalVolume, avgPrice, count);
+   if(count == 0) return;
+
+   // Lay gia cua lenh GAN NHAT (lenh cuoi cung vao basket) de tinh khoang cach DCA tiep theo
+   double lastEntryPrice = GetLastEntryPrice(basketDirection);
+   if(lastEntryPrice == 0) return;
+
+   double ask = SymbolInfoDouble(_Symbol, SYMBOL_ASK);
+   double bid = SymbolInfoDouble(_Symbol, SYMBOL_BID);
+   double curPrice = (basketDirection == 1) ? bid : ask; // gia hien tai theo huong dong lenh
+
+   bool needDCA = false;
+   // Dung lastDCAPrice (gia DCA cuoi) chu khong phai lastEntryPrice (gia lenh cuoi theo thoi gian)
+   // Vi khi gia bounce len roi xuong lai cung muc, lastEntryPrice van la muc cu -> se DCA trung
+   // lastDCAPrice chi cap nhat khi co lenh DCA THANH CONG thuc su -> tranh trung gia
+   double refPrice = (lastDCAPrice != 0) ? lastDCAPrice : lastEntryPrice;
+
+   if(basketDirection == 1 && curPrice <= refPrice - InpDCAStepDistance)
+      needDCA = true;
+   else if(basketDirection == -1 && curPrice >= refPrice + InpDCAStepDistance)
+      needDCA = true;
+
+   if(!needDCA) return;
+
+   double lot = GetDCALot(dcaCount + 1); // dcaCount+1 vi index 0 la lenh dau
+
+   // QUAN TRONG: kiem tra du margin truoc khi gui lenh, tranh spam OrderSend that bai vo han
+   ENUM_ORDER_TYPE orderType = (basketDirection == 1) ? ORDER_TYPE_BUY : ORDER_TYPE_SELL;
+   double entryPrice = (basketDirection == 1) ? ask : bid;
+
+   if(!HasEnoughMarginForLot(lot, orderType, entryPrice))
+     {
+      Print("DUNG DCA: khong du margin cho lot=", lot,
+            " | freeMargin=", AccountInfoDouble(ACCOUNT_MARGIN_FREE),
+            " -> EA se KHONG thu lai nua o muc nay de tranh vong lap loi.");
+      dcaBlockedInsufficientMargin = true; // chan han, khong thu lai cho basket nay nua
+      return;
+     }
+
+   bool sent = false;
+   if(basketDirection == 1)
+      sent = trade.Buy(lot, _Symbol, ask, 0, 0, InpTradeComment + "_DCA" + IntegerToString(dcaCount+1));
+   else
+      sent = trade.Sell(lot, _Symbol, bid, 0, 0, InpTradeComment + "_DCA" + IntegerToString(dcaCount+1));
+
+   // CHI tang dcaCount va cap nhat TP neu lenh THUC SU thanh cong
+   uint retcode = trade.ResultRetcode();
+   if(sent && (retcode == TRADE_RETCODE_DONE || retcode == TRADE_RETCODE_PLACED))
+     {
+      dcaCount++;
+      lastDCAPrice = entryPrice; // luu gia DCA nay, lan sau phai di xa hon muc nay moi DCA tiep
+      Print("DCA lan ", dcaCount, " THANH CONG | lot=", lot, " | gia=", entryPrice);
+      UpdateBasketTP(basketDirection);
+     }
+   else
+     {
+      Print("DCA THAT BAI | retcode=", retcode, " | lot=", lot,
+            " | mota=", trade.ResultRetcodeDescription(),
+            " -> se thu lai o tick sau (khong tang dcaCount de tranh sai lech)");
+     }
+  }
+
+//+------------------------------------------------------------------+
+//| Lay gia vao lenh cua vi the duoc mo gan nhat (theo thoi gian)      |
+//+------------------------------------------------------------------+
+double GetLastEntryPrice(int direction)
+  {
+   datetime latestTime = 0;
+   double latestPrice  = 0;
+
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+
+      long posType = PositionGetInteger(POSITION_TYPE);
+      if(direction == 1 && posType != POSITION_TYPE_BUY) continue;
+      if(direction == -1 && posType != POSITION_TYPE_SELL) continue;
+
+      datetime t = (datetime)PositionGetInteger(POSITION_TIME);
+      if(t >= latestTime)
+        {
+         latestTime  = t;
+         latestPrice = PositionGetDouble(POSITION_PRICE_OPEN);
+        }
+     }
+   return latestPrice;
+  }
+
+//+------------------------------------------------------------------+
+//| Kiem tra basket SL theo tien (neu InpBasketSLMoney > 0)            |
+//+------------------------------------------------------------------+
+void CheckBasketMoneySL()
+  {
+   if(InpBasketSLMoney <= 0) return; // mac dinh tat, theo yeu cau "khong gioi han"
+   if(!basketActive) return;
+
+   double totalProfit = 0;
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      totalProfit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
+     }
+
+   if(totalProfit <= -MathAbs(InpBasketSLMoney))
+     {
+      Print("Basket cham SL theo tien: ", totalProfit, " -> dong toan bo");
+      CloseAllBasketPositions(basketDirection);
+     }
+  }
+
+//+------------------------------------------------------------------+
+void CloseAllBasketPositions(int direction)
+  {
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+
+      long posType = PositionGetInteger(POSITION_TYPE);
+      if(direction == 1 && posType != POSITION_TYPE_BUY) continue;
+      if(direction == -1 && posType != POSITION_TYPE_SELL) continue;
+
+      trade.PositionClose(ticket);
+     }
+   ResetBasketState();
+  }
+
+//+------------------------------------------------------------------+
+void ResetBasketState()
+  {
+   basketActive    = false;
+   basketDirection = 0;
+   dcaCount        = 0;
+   dcaBlockedInsufficientMargin = false;
+   lastDCAPrice    = 0;
+   pendingBuyTicket  = 0;
+   pendingSellTicket = 0;
+  }
+
+//+------------------------------------------------------------------+
+//| Phat hien 1 trong 2 lenh cho vua khop (chuyen thanh position)      |
+//+------------------------------------------------------------------+
+void CheckPendingFilled()
+  {
+   if(basketActive) return; // da co basket roi thi khong can kiem tra nua
+
+   bool buyHasPosition  = HasOpenPosition(POSITION_TYPE_BUY);
+   bool sellHasPosition = HasOpenPosition(POSITION_TYPE_SELL);
+
+   if(buyHasPosition && !sellHasPosition)
+     {
+      // Buy Stop da khop -> huy Sell Stop con lai
+      DeletePendingIfExists(pendingSellTicket);
+      pendingSellTicket = 0;
+      basketActive    = true;
+      basketDirection = 1;
+      dcaCount        = 0;
+      lastDCAPrice    = 0;
+      Print("Buy Stop da khop -> huy Sell Stop -> bat dau basket BUY");
+      UpdateBasketTP(1);
+     }
+   else if(sellHasPosition && !buyHasPosition)
+     {
+      // Sell Stop da khop -> huy Buy Stop con lai
+      DeletePendingIfExists(pendingBuyTicket);
+      pendingBuyTicket = 0;
+      basketActive    = true;
+      basketDirection = -1;
+      dcaCount        = 0;
+      lastDCAPrice    = 0;
+      Print("Sell Stop da khop -> huy Buy Stop -> bat dau basket SELL");
+      UpdateBasketTP(-1);
+     }
+  }
+
+//+------------------------------------------------------------------+
+bool HasOpenPosition(long type)
+  {
+   for(int i = PositionsTotal()-1; i >= 0; i--)
+     {
+      ulong ticket = PositionGetTicket(i);
+      if(ticket == 0 || !PositionSelectByTicket(ticket)) continue;
+      if(PositionGetString(POSITION_SYMBOL) != _Symbol) continue;
+      if(PositionGetInteger(POSITION_MAGIC) != (long)InpMagicNumber) continue;
+      if(PositionGetInteger(POSITION_TYPE) == type) return true;
+     }
+   return false;
+  }
+
+//+------------------------------------------------------------------+
+//| Kiem tra basket da dong het chua (TP khop) -> reset va dat lai cap |
+//+------------------------------------------------------------------+
+void CheckBasketClosed()
+  {
+   if(!basketActive) return;
+
+   bool stillHasPosition = HasOpenPosition(POSITION_TYPE_BUY) || HasOpenPosition(POSITION_TYPE_SELL);
+   if(!stillHasPosition)
+     {
+      Print("Basket da dong het (TP khop) -> dat lai cap Buy Stop/Sell Stop moi");
+      ResetBasketState();
+      PlaceInitialStopPair();
+     }
+  }
+
+//+------------------------------------------------------------------+
+void OnTick()
+  {
+   // 1) Kiem tra xem 1 trong 2 lenh cho da khop chua
+   CheckPendingFilled();
+
+   // 2) Neu dang co basket -> kiem tra DCA
+   if(basketActive)
+     {
+      CheckAndDoDCA();
+      CheckBasketMoneySL(); // chi chay neu InpBasketSLMoney > 0 (mac dinh tat = khong gioi han)
+      CheckBasketClosed();  // kiem tra TP da khop chua -> dat lai cap moi
+     }
+
+   // 3) Neu khong co gi (chua bao gio dat lenh, vd sau khi xoa thu cong) -> dat lai
+   if(!basketActive && pendingBuyTicket == 0 && pendingSellTicket == 0)
+     {
+      if(!HasAnyEAOrderOrPosition())
+         PlaceInitialStopPair();
+     }
+  }
+//+------------------------------------------------------------------+
