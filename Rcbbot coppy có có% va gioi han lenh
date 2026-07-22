@@ -24,7 +24,7 @@ input double InpInitialTPDistance    = 1.0;   // Khoang cach TP tu gia Stop
 
 input group "=== DCA (Nhoi lenh khi gia di nguoc) ==="
 input double InpDCAStepDistance      = 1.0;   // Khoang cach moi lan DCA (theo gia)
-input int    InpMaxDCALevels         = 0;     // So lan DCA toi da (0 = khong gioi han)
+input int    InpMaxDCALevels         = 6;     // Gioi han tong so lenh trong basket (0 = khong gioi han, vd 6 = toi da 6 lenh)
 input bool   InpUseFibonacciLots     = true;  // Dung Fibonacci cho khoi luong
 
 input group "=== TP chung cho ca basket ==="
@@ -32,7 +32,7 @@ input double InpBasketTPDistance     = 1.0;   // TP cach gia trung binh basket (
 input double InpBasketSLMoney        = 0;     // SL theo tien USD (0 = tat)
 
 input group "=== Bao ve tai khoan ==="
-input double InpStopLossPercent      = 50;    // Cat lo khi lo vuot X% so du tai khoan (0 = tat)
+input double InpStopLossDollar       = 300;   // Cat lo khi lo vuot X$ (vd 300 = dong het khi lo 300 USD, 0 = tat)
 input int    InpTrailingStartLevel   = 8;     // Bat dau trailing tu lenh thu may (vd 8 = tu lenh thu 8)
 input double InpTrailingFromBE       = 0.3;   // Chot loi khi gia hoi ve hoa von + X gia (vd 0.3)
 
@@ -326,7 +326,7 @@ bool HasEnoughMarginForLot(double lot, ENUM_ORDER_TYPE orderType, double price)
 void CheckAndDoDCA()
   {
    if(!basketActive || basketDirection == 0) return;
-   if(InpMaxDCALevels > 0 && dcaCount >= InpMaxDCALevels) return; // co gioi han (mac dinh 0 = khong gioi han)
+   if(InpMaxDCALevels > 0 && dcaCount + 1 >= InpMaxDCALevels) return; // tong lenh da dat gioi han
    if(dcaBlockedInsufficientMargin) return; // da het margin truoc do, khong thu DCA nua cho basket nay
 
    double totalVolume, avgPrice;
@@ -466,15 +466,12 @@ void CloseAllBasketPositions(int direction)
   }
 
 //+------------------------------------------------------------------+
-//| Cat lo khi lo vuot X% so du tai khoan                             |
+//| Cat lo khi lo vuot X$ (tinh tren toan bo basket)                  |
 //+------------------------------------------------------------------+
-void CheckStopLossPercent()
+void CheckStopLossDollar()
   {
-   if(InpStopLossPercent <= 0) return;
+   if(InpStopLossDollar <= 0) return;
    if(!basketActive) return;
-
-   double balance = AccountInfoDouble(ACCOUNT_BALANCE);
-   if(balance <= 0) return;
 
    double totalProfit = 0;
    for(int i = PositionsTotal()-1; i >= 0; i--)
@@ -486,11 +483,10 @@ void CheckStopLossPercent()
       totalProfit += PositionGetDouble(POSITION_PROFIT) + PositionGetDouble(POSITION_SWAP);
      }
 
-   double lossPercent = (-totalProfit / balance) * 100.0;
-   if(lossPercent >= InpStopLossPercent)
+   if(totalProfit <= -MathAbs(InpStopLossDollar))
      {
-      Print("CAT LO: lo ", DoubleToString(lossPercent, 1), "% vuot nguong ",
-            InpStopLossPercent, "% -> dong toan bo basket");
+      Print("CAT LO: lo ", DoubleToString(-totalProfit, 2), "$ vuot nguong ",
+            InpStopLossDollar, "$ -> dong toan bo basket");
       CloseAllBasketPositions(basketDirection);
      }
   }
@@ -649,7 +645,7 @@ void OnTick()
      {
       CheckAndDoDCA();
       CheckBasketMoneySL();       // SL theo USD (mac dinh tat)
-      CheckStopLossPercent();     // Cat lo theo % balance
+      CheckStopLossDollar();      // Cat lo theo $ (mac dinh 300 USD)
       CheckTrailingFromBE();      // Chot loi tu lenh thu N khi hoi ve hoa von + X gia
       CheckBasketClosed();        // TP da khop chua -> dat lai cap moi
      }
